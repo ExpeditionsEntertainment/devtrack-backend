@@ -23,7 +23,7 @@ const devs = require('../devs');
 const B = require('./board');
 
 const MODEL = () => process.env.BOARD_MODEL || 'claude-opus-5-5';
-const ACTIONS = ['mark_done', 'mark_in_progress', 'mark_untasked', 'add_note', 'needs_reply', 'progress_update'];
+const ACTIONS = ['mark_done', 'mark_in_progress', 'mark_untasked', 'mark_blocked', 'add_note', 'needs_reply', 'progress_update'];
 const MAX_BATCH = 250;
 const DASHBOARD = () => (process.env.DASHBOARD_URL || 'https://lambent-lily-7bf643.netlify.app').replace(/\/+$/, '');
 
@@ -77,13 +77,15 @@ async function addMessage(m, prisma = getPrisma(), download = fetch) {
 // ── going through them ──
 
 const SYSTEM = `You help Alex, who runs asset production for a Roblox game, keep the asset board up to date.
-The board lists cards (mostly units: characters) and their tasks (Animations, Mesh, Texture, Aura, Icons, VFX, Cosmetic...), some with subtasks of their own (Icons › Equipment, Texture › Shiny...), each Untasked, In progress (with the developer doing it) or Done.
+The board lists cards (mostly units: characters) and their tasks (Animations, Mesh, Texture, Aura, Icons, VFX, Cosmetic...), some with subtasks of their own (Icons › Equipment, Texture › Shiny...), each Untasked, In progress (with the developer doing it), Blocked (with what is blocking it) or Done.
 You get the board as it stands and the developers' recent Discord messages. Suggest the changes the messages clearly support, for Alex to approve:
 - mark_done: the developer says a task is finished or posts its final files.
 - mark_in_progress: a developer says they have started a task that is Untasked (dev: their name exactly as on the roster).
 - mark_untasked: a developer says they have stopped or dropped a task.
+- mark_blocked: a developer says they can't go on with a task until something happens (waiting on references, a decision, another task, access, a bug). The summary says what is blocking it.
+A Blocked task moving on again (the developer got what they needed and carries on, or finished it) is mark_in_progress or mark_done, and the summary says what unblocked it.
 - add_note: something worth keeping on a task: an ETA, a requirement, feedback, a decision.
-- needs_reply: a question, request or blocker that needs Alex's answer.
+- needs_reply: a question or request that needs Alex's answer (when it also holds up a task, suggest mark_blocked for that task too).
 - progress_update: work in progress on a task (a screenshot, "almost done", "working on the shading").
 Rules: refer to people by name; never assume anyone's gender (no he/she). Use only issue identifiers from the board ("ASS-40"), or "" when no task fits (needs_reply only). Put all messages about the same task in one suggestion. Skip greetings, chatter and anything that changes nothing. Don't suggest a status a task already has. summary: one short plain sentence to Alex, naming the developer and the unit, e.g. "Ruku says the Rukia texture is finished and posted 2 images." confidence: how sure you are the messages mean this.`;
 
@@ -139,11 +141,12 @@ const day = d => new Date(d).toISOString().slice(0, 10);
 
 function boardText(b) {
   const lines = ['BOARD (identifier | card › task | status | developer | in progress since)'];
+  const statusOf = x => (x.status === 'blocked' ? `blocked${x.blocked?.reason ? ` (${x.blocked.reason.replace(/\s+/g, ' ')})` : ''}` : x.status.replace('_', ' '));
   for (const u of b.cards) {
     for (const t of u.tasks) {
       for (const x of [t, ...t.subtasks]) {
         const label = x === t ? t.name : `${t.name} › ${x.name}`;
-        lines.push(`${x.identifier} | ${u.name} › ${label} | ${x.status.replace('_', ' ')} | ${x.devName || '-'} | ${x.status === 'in_progress' && x.startedAt ? day(x.startedAt) : '-'}`);
+        lines.push(`${x.identifier} | ${u.name} › ${label} | ${statusOf(x)} | ${x.devName || '-'} | ${x.status === 'in_progress' && x.startedAt ? day(x.startedAt) : '-'}`);
       }
     }
   }
@@ -157,6 +160,9 @@ function messagesText(msgs) {
     return `[${m.id}] ${new Date(m.postedAt).toISOString().slice(0, 16).replace('T', ' ')} ${m.place ? `#${m.place} ` : ''}${m.authorName} (${m.authorId}): ${(m.content || '').replace(/\s+/g, ' ').slice(0, 1200)}${files ? ` [files: ${files}]` : ''}`;
   })].join('\n');
 }
+
+// A status suggestion for a task that already has that status changes nothing.
+const SAME = { mark_done: 'done', mark_untasked: 'untasked', mark_blocked: 'blocked' };
 
 let running = null;
 async function triage(prisma = getPrisma(), ask = askClaude) {
@@ -181,7 +187,8 @@ async function triage(prisma = getPrisma(), ask = askClaude) {
         ...s, message_ids: (s.message_ids || []).filter(id => ids.has(id)),
         issue: byIdent.has(s.issue) ? s.issue : '', dev: roster.has(s.dev) ? s.dev : '',
       })).filter(s => ACTIONS.includes(s.action) && s.message_ids.length && (s.issue || s.action === 'needs_reply')
-        && !(s.action === 'mark_in_progress' && !s.dev));
+        && !(s.action === 'mark_in_progress' && !s.dev)
+        && !(SAME[s.action] && byIdent.get(s.issue)?.status === SAME[s.action])); // nothing to change
     } catch (err) {
       // Without Claude the messages still reach the list: one item per person per place, to read through.
       error = err.message;
@@ -235,14 +242,15 @@ async function inbox(prisma = getPrisma()) {
   };
 }
 
-// Apply: a status, or a note onto the task; either way it leaves the list.
+// Apply: a status, or a note onto the task; either way it leaves the list. Blocking takes the reason
+// (opts.reason, or the summary), and moving a blocked task on takes what unblocked it (opts.resolution).
 async function decide(id, decision, by, prisma = getPrisma(), opts = {}) {
   await B.ensureSchema(prisma);
   const [s] = await prisma.$queryRawUnsafe(`SELECT * FROM "BoardSuggestion" WHERE id = $1`, id);
   if (!s) throw new B.BoardError(404, 'No such update');
   if (s.status !== 'open') throw new B.BoardError(409, 'Already done');
   if (decision === 'apply') {
-    const status = { mark_done: 'done', mark_in_progress: 'in_progress', mark_untasked: 'untasked' }[s.action];
+    const status = { mark_done: 'done', mark_in_progress: 'in_progress', mark_untasked: 'untasked', mark_blocked: 'blocked' }[s.action];
     if (status) {
       if (!s.issueId) throw new B.BoardError(400, 'This update is not tied to a task');
       let devId = opts.devId;
@@ -250,7 +258,9 @@ async function decide(id, decision, by, prisma = getPrisma(), opts = {}) {
         const { byName } = await B.roster(prisma);
         devId = byName.get(String(s.dev || '').toLowerCase())?.id;
       }
-      await B.setStatus(s.issueId, status, devId, by, prisma);
+      await B.setStatus(s.issueId, status, status === 'blocked' ? undefined : devId, by, prisma, {
+        reason: status === 'blocked' ? (String(opts.reason || '').trim() || s.summary) : undefined, resolution: opts.resolution,
+      });
     } else if (s.action === 'add_note' && s.issueId) {
       const [cur] = await prisma.$queryRawUnsafe(`SELECT text FROM "BoardNote" WHERE "issueId" = $1`, s.issueId);
       const [m] = await prisma.$queryRawUnsafe(`SELECT url FROM "BoardMessage" WHERE id = $1`, json(s.messageIds)[0] || '');
@@ -283,9 +293,17 @@ async function digest(prisma = getPrisma(), send = notifier.boardDigest, now = n
     unit: u.name, task: x === t ? t.name : `${t.name} › ${x.name}`, dev: x.devName, days: Math.floor(x.quietDays),
     url: `${DASHBOARD()}/assets/?item=${encodeURIComponent(x.identifier)}`,
   })))).sort((a, b2) => b2.days - a.days);
-  const payload = { date: local.date, stale, updates: b.inbox.open, url: `${DASHBOARD()}/assets/?show=checkin`, updatesUrl: `${DASHBOARD()}/assets/?show=updates` };
-  await B.setMeta('digest', { date: local.date, at: now, stale: stale.length, updates: b.inbox.open }, prisma);
-  if (!stale.length && !b.inbox.open) return { ...payload, sent: false };
+  // Blocked ones, longest first: each waits on somebody to clear it.
+  const blocked = b.cards.flatMap(u => u.tasks.flatMap(t => [t, ...t.subtasks].filter(x => x.status === 'blocked').map(x => ({
+    unit: u.name, task: x === t ? t.name : `${t.name} › ${x.name}`, dev: x.devName, reason: x.blocked?.reason || '', days: Math.floor(x.blocked?.days || 0),
+    url: `${DASHBOARD()}/assets/?item=${encodeURIComponent(x.identifier)}`,
+  })))).sort((a, b2) => b2.days - a.days);
+  const payload = {
+    date: local.date, stale, blocked, updates: b.inbox.open,
+    url: `${DASHBOARD()}/assets/?show=checkin`, blockedUrl: `${DASHBOARD()}/assets/?show=blocked`, updatesUrl: `${DASHBOARD()}/assets/?show=updates`,
+  };
+  await B.setMeta('digest', { date: local.date, at: now, stale: stale.length, blocked: blocked.length, updates: b.inbox.open }, prisma);
+  if (!stale.length && !blocked.length && !b.inbox.open) return { ...payload, sent: false };
   await send(payload);
   return { ...payload, sent: true };
 }

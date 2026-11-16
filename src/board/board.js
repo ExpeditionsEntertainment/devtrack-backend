@@ -6,7 +6,9 @@
 //   card       a unit (Doumo, Rukia...) or anything else being made; kind 'unit' for the old ones
 //   task       a piece of work on a card (Animations, Mesh, Texture...), each with its own status
 //   subtask    a piece of a task, tracked on its own (Icons › Equipment, Texture › Shiny...)
-//   status     untasked, in_progress (with the dev doing it), done
+//   status     untasked, in_progress (with the dev doing it), blocked, done
+//   block      why a task is blocked, and what unblocked it: a reason is needed to block one,
+//              and a resolution to move it on again (BoardBlock keeps every block, for the history)
 //   delivery   a link to a Discord message sent with "Send to Assets": where the files are
 //
 // Plus what was already DevTrack's: images (a card's base image, reference images on
@@ -29,7 +31,7 @@ const DEFAULTS = {
   extraChannels: [], // and these channels (or categories, forums)
 };
 
-const STATUSES = ['untasked', 'in_progress', 'done'];
+const STATUSES = ['untasked', 'in_progress', 'blocked', 'done'];
 const PREFIX = 'ASS';
 
 // A new unit starts with these, in this order; the order is also how every card's tasks are sorted.
@@ -39,8 +41,9 @@ const UNIT_TEMPLATE = [
 ];
 const ORDER = [/anim/, /mesh|model/, /texture/, /aura/, /icon/, /vfx|effect/, /cosmetic|skin/];
 const orderOf = name => { const n = String(name || '').toLowerCase(); const i = ORDER.findIndex(re => re.test(n)); return i < 0 ? ORDER.length : i; };
-const RANK = { untasked: 0, in_progress: 1, done: 2 };
-// Untasked at the top, in progress in the middle, done at the bottom; within each, the template's order.
+const RANK = { blocked: 0, untasked: 1, in_progress: 2, done: 3 };
+// Blocked at the very top (it needs someone to act), then untasked, in progress, and done at the bottom;
+// within each, the template's order.
 const byBoardOrder = (a, b) => RANK[a.status] - RANK[b.status] || orderOf(a.name) - orderOf(b.name)
   || a.name.localeCompare(b.name) || String(a.createdAt).localeCompare(String(b.createdAt));
 
@@ -76,12 +79,15 @@ async function ensureSchema(prisma = getPrisma()) {
       "createdAt" TIMESTAMP NOT NULL DEFAULT now(), "updatedAt" TIMESTAMP NOT NULL DEFAULT now())`,
     `CREATE TABLE IF NOT EXISTS "BoardDelivery" ("id" TEXT PRIMARY KEY, "taskId" TEXT NOT NULL, "url" TEXT NOT NULL,
       "files" JSONB NOT NULL DEFAULT '[]'::jsonb, "note" TEXT, "devName" TEXT, "by" TEXT, "at" TIMESTAMP NOT NULL DEFAULT now())`,
+    `CREATE TABLE IF NOT EXISTS "BoardBlock" ("id" TEXT PRIMARY KEY, "taskId" TEXT NOT NULL, "reason" TEXT NOT NULL, "from" TEXT, "by" TEXT,
+      "at" TIMESTAMP NOT NULL DEFAULT now(), "resolution" TEXT, "to" TEXT, "resolvedBy" TEXT, "resolvedAt" TIMESTAMP)`,
     `CREATE INDEX IF NOT EXISTS "BoardImage_issue" ON "BoardImage" ("issueId")`,
     `CREATE INDEX IF NOT EXISTS "BoardActivity_issue" ON "BoardActivity" ("issueId", "at")`,
     `CREATE INDEX IF NOT EXISTS "BoardMessage_triaged" ON "BoardMessage" ("triagedAt")`,
     `CREATE INDEX IF NOT EXISTS "BoardMessage_author" ON "BoardMessage" ("authorId", "postedAt")`,
     `CREATE INDEX IF NOT EXISTS "BoardCardTask_card" ON "BoardCardTask" ("cardId")`,
     `CREATE INDEX IF NOT EXISTS "BoardDelivery_task" ON "BoardDelivery" ("taskId", "at")`,
+    `CREATE INDEX IF NOT EXISTS "BoardBlock_task" ON "BoardBlock" ("taskId", "at")`,
   ];
   for (const sql of tables) await prisma.$executeRawUnsafe(sql);
   ready.add(prisma);
@@ -155,6 +161,13 @@ const cleanName = (v, what = 'A name') => {
   const s = String(v ?? '').replace(/\s+/g, ' ').trim();
   if (!s) throw new BoardError(400, `${what} is required`);
   if (s.length > 80) throw new BoardError(400, `${what} is too long (80 characters at most)`);
+  return s;
+};
+// A block's reason or resolution: a sentence or a few.
+const cleanText = (v, what) => {
+  const s = String(v ?? '').replace(/[ \t]+/g, ' ').trim();
+  if (!s) throw new BoardError(400, what);
+  if (s.length > 500) throw new BoardError(400, 'That is too long (500 characters at most)');
   return s;
 };
 
@@ -282,6 +295,8 @@ async function board(prisma = getPrisma(), now = new Date()) {
   for (const im of images) imgsOf.set(im.issueId, [...(imgsOf.get(im.issueId) || []), { id: im.id, url: imageUrl(im.id), kind: im.kind, caption: im.caption, width: im.width, height: im.height }]);
   const kids = new Map();
   for (const t of taskRows) if (t.parentId) kids.set(t.parentId, [...(kids.get(t.parentId) || []), t]);
+  const blocks = new Map((await prisma.$queryRawUnsafe(`SELECT DISTINCT ON ("taskId") "taskId", reason, "from", by, at FROM "BoardBlock"
+    WHERE "resolvedAt" IS NULL ORDER BY "taskId", at DESC`)).map(b => [b.taskId, b]));
 
   const item = (t, depth) => {
     const dev = (t.devId && byId.get(t.devId)) || (t.devName && byName.get(t.devName.toLowerCase())) || null;
@@ -298,6 +313,7 @@ async function board(prisma = getPrisma(), now = new Date()) {
       needsCheckin: t.status === 'in_progress' && quiet != null && quiet >= set.checkInDays && !checkedRecently,
       checkedInAt: checkin?.at || null, pingedAt: ping?.at || null, lastDiscord: discord ? { at: discord.at, text: discord.text, url: discord.url } : null,
       images: imgsOf.get(t.id) || [], notes: notes.get(t.id)?.text || '', deliveries: sent,
+      blocked: t.status === 'blocked' ? blockOf(blocks.get(t.id), t, now) : null,
     };
     if (depth === 1) out.subtasks = (kids.get(t.id) || []).map(s => item(s, 2)).sort(byBoardOrder);
     return out;
@@ -315,10 +331,7 @@ async function board(prisma = getPrisma(), now = new Date()) {
       baseImage: cardImages.filter(im => im.kind === 'base').at(-1) || null,
       images: cardImages.filter(im => im.kind === 'ref'), notes: notes.get(c.id)?.text || '',
       tasks,
-      counts: {
-        untasked: all.filter(x => x.status === 'untasked').length, in_progress: all.filter(x => x.status === 'in_progress').length,
-        done: all.filter(x => x.status === 'done').length, total: all.length, checkin: all.filter(x => x.needsCheckin).length,
-      },
+      counts: { ...countOf(all), total: all.length },
     };
   });
   const everything = cards.flatMap(c => c.tasks.flatMap(t => [t, ...t.subtasks]));
@@ -328,7 +341,7 @@ async function board(prisma = getPrisma(), now = new Date()) {
   const devsOut = devList.map(d => {
     const mine = cards.flatMap(c => c.tasks.flatMap(t => [t, ...t.subtasks].filter(x => x.devId === d.id).map(x => ({
       id: x.id, identifier: x.identifier, card: c.name, cardId: c.id, task: x === t ? t.name : `${t.name} › ${x.name}`, status: x.status,
-      startedAt: x.startedAt, completedAt: x.completedAt, needsCheckin: x.needsCheckin,
+      startedAt: x.startedAt, completedAt: x.completedAt, needsCheckin: x.needsCheckin, blocked: x.blocked,
     }))));
     const working = mine.filter(x => x.status === 'in_progress');
     const lastSeen = [d.discordUserId && seen.get(d.discordUserId), ...mine.map(x => x.completedAt || x.startedAt)].filter(Boolean)
@@ -337,7 +350,7 @@ async function board(prisma = getPrisma(), now = new Date()) {
     const state = d.away ? 'away' : working.length ? 'working' : quietFor == null || quietFor >= set.quietDays ? 'quiet' : 'free';
     return {
       ...d, state, lastSeen, quietDays: quietFor == null ? null : Math.floor(quietFor),
-      working, doneCount: mine.filter(x => x.status === 'done').length,
+      working, blocked: mine.filter(x => x.status === 'blocked'), doneCount: mine.filter(x => x.status === 'done').length,
       recentDone: mine.filter(x => x.status === 'done' && x.completedAt).sort((a, b) => new Date(b.completedAt) - new Date(a.completedAt)).slice(0, 3),
     };
   });
@@ -346,14 +359,23 @@ async function board(prisma = getPrisma(), now = new Date()) {
   return {
     cards, updates: updates.map(u => ({ id: u.id, name: u.name, cards: cards.filter(c => c.update?.id === u.id).length })),
     devs: devsOut, settings: set, template: UNIT_TEMPLATE,
-    counts: {
-      untasked: everything.filter(x => x.status === 'untasked').length, in_progress: everything.filter(x => x.status === 'in_progress').length,
-      done: everything.filter(x => x.status === 'done').length, checkin: everything.filter(x => x.needsCheckin).length,
-    },
+    counts: countOf(everything),
     inbox: { open: inbox.n, triage: await getMeta('triage', prisma) },
     imported: await getMeta('linearImport', prisma),
   };
 }
+
+// How many of each status, and how many need a check-in.
+const countOf = list => ({
+  ...Object.fromEntries(STATUSES.map(st => [st, list.filter(x => x.status === st).length])),
+  checkin: list.filter(x => x.needsCheckin).length,
+});
+
+// A blocked task's block: why, who said so, since when. (One blocked without a reason on file shows an empty one.)
+const blockOf = (b, t, now) => {
+  const since = b?.at || t.updatedAt;
+  return { reason: b?.reason || '', by: b?.by || null, since, from: b?.from || null, days: Math.round(daysSince(since, now) * 10) / 10 };
+};
 
 // ── looking things up ──
 
@@ -402,10 +424,10 @@ async function search(text, { withDone = false, limit = 25 } = {}, prisma = getP
     .sort((a, b) => RANK[a.status] - RANK[b.status] || a.label.localeCompare(b.label)).slice(0, limit).map(pick);
 }
 
-// A dev's tasks to send files for: in progress, and done in the last two weeks, each followed by its subtasks.
+// A dev's tasks to send files for: in progress or blocked, and done in the last two weeks, each followed by its subtasks.
 async function tasksOf(devId, prisma = getPrisma(), now = new Date()) {
   const all = await labels(prisma);
-  const recent = t => t.status === 'in_progress' || (t.status === 'done' && t.completedAt && daysSince(t.completedAt, now) <= 14);
+  const recent = t => ['in_progress', 'blocked'].includes(t.status) || (t.status === 'done' && t.completedAt && daysSince(t.completedAt, now) <= 14);
   const mine = all.filter(t => t.devId === devId && recent(t)).sort((a, b) => RANK[a.status] - RANK[b.status] || a.label.localeCompare(b.label));
   const out = [];
   for (const t of mine) {
@@ -422,26 +444,60 @@ async function event(prisma, issueId, from, to, dev, by) {
     newId(), issueId, from, to, dev || null, by || null);
 }
 
-// Untasked / In progress (with a dev from the Developers tab) / Done.
-async function setStatus(ref, status, devId, by, prisma = getPrisma()) {
-  if (!STATUSES.includes(status)) throw new BoardError(400, 'status must be untasked, in_progress or done');
+async function openBlock(taskId, prisma) {
+  const [b] = await prisma.$queryRawUnsafe(`SELECT * FROM "BoardBlock" WHERE "taskId" = $1 AND "resolvedAt" IS NULL ORDER BY at DESC LIMIT 1`, taskId);
+  return b || null;
+}
+
+// Closes a task's block with what unblocked it.
+async function resolveBlock(prisma, taskId, resolution, to, by) {
+  const n = await prisma.$executeRawUnsafe(`UPDATE "BoardBlock" SET resolution = $2, "to" = $3, "resolvedBy" = $4, "resolvedAt" = now()
+    WHERE "taskId" = $1 AND "resolvedAt" IS NULL`, taskId, resolution, to, by || null);
+  // Blocked without a reason on file: the resolution is kept all the same.
+  if (!n) {
+    await prisma.$executeRawUnsafe(`INSERT INTO "BoardBlock" (id, "taskId", reason, resolution, "to", "resolvedBy", "resolvedAt") VALUES ($1, $2, '', $3, $4, $5, now())`,
+      newId(), taskId, resolution, to, by || null);
+  }
+}
+
+// Untasked / In progress (with a dev from the Developers tab) / Blocked (with the reason) / Done.
+// Moving a blocked task on, to anything else, needs the resolution: what unblocked it.
+// Blocking keeps whoever is on the task (or puts devId on it, if given); blocking a blocked task changes the reason.
+async function setStatus(ref, status, devId, by, prisma = getPrisma(), { reason, resolution } = {}) {
+  if (!STATUSES.includes(status)) throw new BoardError(400, 'status must be untasked, in_progress, blocked or done');
   const t = await findTask(ref, prisma);
   let dev = null;
-  if (status === 'in_progress') {
+  if (status === 'in_progress' || (status === 'blocked' && devId)) {
     const { byId } = await roster(prisma);
     dev = byId.get(devId);
     if (!dev) throw new BoardError(400, 'Pick a developer from the Developers tab');
   }
-  if (status === 'in_progress') {
-    await prisma.$executeRawUnsafe(`UPDATE "BoardCardTask" SET status = 'in_progress', "devId" = $2, "devName" = $3,
-      "startedAt" = CASE WHEN status = 'in_progress' AND "devId" = $2 THEN "startedAt" ELSE now() END, "completedAt" = NULL, "updatedAt" = now() WHERE id = $1`,
-    t.id, dev.id, dev.name);
-  } else if (status === 'done') {
-    await prisma.$executeRawUnsafe(`UPDATE "BoardCardTask" SET status = 'done', "completedAt" = CASE WHEN status = 'done' THEN "completedAt" ELSE now() END,
-      "updatedAt" = now() WHERE id = $1`, t.id);
+  const why = status === 'blocked' ? cleanText(reason, 'Say what is blocking it') : null;
+  const fix = t.status === 'blocked' && status !== 'blocked' ? cleanText(resolution, `${t.identifier} is blocked: say what unblocked it`) : null;
+
+  if (status === 'blocked') {
+    const open = t.status === 'blocked' ? await openBlock(t.id, prisma) : null;
+    if (open) await prisma.$executeRawUnsafe(`UPDATE "BoardBlock" SET reason = $2 WHERE id = $1`, open.id, why);
+    else {
+      await prisma.$executeRawUnsafe(`INSERT INTO "BoardBlock" (id, "taskId", reason, "from", by) VALUES ($1, $2, $3, $4, $5)`,
+        newId(), t.id, why, t.status === 'blocked' ? null : t.status, by || null);
+    }
+    await prisma.$executeRawUnsafe(`UPDATE "BoardCardTask" SET status = 'blocked', "devId" = COALESCE($2, "devId"), "devName" = COALESCE($3, "devName"),
+      "completedAt" = NULL, "updatedAt" = now() WHERE id = $1`, t.id, dev?.id || null, dev?.name || null);
   } else {
-    await prisma.$executeRawUnsafe(`UPDATE "BoardCardTask" SET status = 'untasked', "devId" = NULL, "devName" = NULL, "startedAt" = NULL,
-      "completedAt" = NULL, "updatedAt" = now() WHERE id = $1`, t.id);
+    if (fix) await resolveBlock(prisma, t.id, fix, status, by);
+    if (status === 'in_progress') {
+      // Back to it after a block, by the same dev: it keeps the day it was started.
+      await prisma.$executeRawUnsafe(`UPDATE "BoardCardTask" SET status = 'in_progress', "devId" = $2, "devName" = $3,
+        "startedAt" = CASE WHEN status IN ('in_progress', 'blocked') AND "devId" = $2 THEN COALESCE("startedAt", now()) ELSE now() END,
+        "completedAt" = NULL, "updatedAt" = now() WHERE id = $1`, t.id, dev.id, dev.name);
+    } else if (status === 'done') {
+      await prisma.$executeRawUnsafe(`UPDATE "BoardCardTask" SET status = 'done', "completedAt" = CASE WHEN status = 'done' THEN "completedAt" ELSE now() END,
+        "updatedAt" = now() WHERE id = $1`, t.id);
+    } else {
+      await prisma.$executeRawUnsafe(`UPDATE "BoardCardTask" SET status = 'untasked', "devId" = NULL, "devName" = NULL, "startedAt" = NULL,
+        "completedAt" = NULL, "updatedAt" = now() WHERE id = $1`, t.id);
+    }
   }
   if (t.status !== status || (dev && dev.id !== t.devId)) await event(prisma, t.id, t.status, status, dev?.name || t.devName, by);
   return findTask(t.id, prisma);
@@ -475,6 +531,7 @@ async function removeTask(ref, prisma = getPrisma()) {
   await prisma.$executeRawUnsafe(`DELETE FROM "BoardDelivery" WHERE "taskId" = ANY($1::text[])`, ids);
   await prisma.$executeRawUnsafe(`DELETE FROM "BoardImage" WHERE "issueId" = ANY($1::text[])`, ids);
   await prisma.$executeRawUnsafe(`DELETE FROM "BoardNote" WHERE "issueId" = ANY($1::text[])`, ids);
+  await prisma.$executeRawUnsafe(`DELETE FROM "BoardBlock" WHERE "taskId" = ANY($1::text[])`, ids);
   return { removed: ids.length };
 }
 
@@ -557,7 +614,8 @@ async function removeUpdate(id, prisma = getPrisma()) {
   return { ok: true };
 }
 
-// "Send to Assets": a link to the Discord message with the work in it, and the task is done.
+// "Send to Assets": a link to the Discord message with the work in it, and the task is done (a blocked
+// one is unblocked by it, and the link is kept as the resolution).
 async function deliver(ref, { url, files = [], note, devId, devName, by } = {}, prisma = getPrisma()) {
   const t = await findTask(ref, prisma);
   if (!/^https:\/\/(?:\w+\.)?discord(?:app)?\.com\/channels\/\S+$/.test(String(url || ''))) throw new BoardError(400, 'That is not a link to a Discord message');
@@ -573,6 +631,8 @@ async function deliver(ref, { url, files = [], note, devId, devName, by } = {}, 
     await prisma.$executeRawUnsafe(`UPDATE "BoardCardTask" SET "devName" = $2 WHERE id = $1`, t.id, name);
   }
   const was = t.status;
+  // The work arriving is what unblocked it.
+  if (was === 'blocked') await resolveBlock(prisma, t.id, `Sent to Assets${name ? ` by ${name}` : ''}: ${url}`, 'done', by);
   if (was !== 'done') {
     await prisma.$executeRawUnsafe(`UPDATE "BoardCardTask" SET status = 'done', "completedAt" = now(), "updatedAt" = now() WHERE id = $1`, t.id);
     await event(prisma, t.id, was, 'done', name, by);
@@ -595,7 +655,9 @@ async function history(ref, prisma = getPrisma()) {
   const id = await idOf(ref, prisma);
   const events = await prisma.$queryRawUnsafe(`SELECT "from", "to", dev, by, at FROM "BoardEvent" WHERE "issueId" = $1 ORDER BY at DESC LIMIT 30`, id);
   const acts = await prisma.$queryRawUnsafe(`SELECT kind, text, url, by, at FROM "BoardActivity" WHERE "issueId" = $1 ORDER BY at DESC LIMIT 30`, id);
-  return { events, activity: acts };
+  const blocks = await prisma.$queryRawUnsafe(`SELECT reason, "from", by, at, resolution, "to", "resolvedBy", "resolvedAt" FROM "BoardBlock"
+    WHERE "taskId" = $1 ORDER BY at DESC LIMIT 30`, id);
+  return { events, activity: acts, blocks };
 }
 
 // Each dev with a place on Discord and what they have in progress, for the dots.
@@ -610,5 +672,5 @@ module.exports = {
   setStatus, renameTask, addTask, removeTask, createCard, updateCard, archiveCard,
   createUpdate, renameUpdate, removeUpdate, deliver, removeDelivery, deliveriesOf, history, search, tasksOf, working,
   addImage, useImage, image, removeImage, imageUrl, setNotes, addActivity, nextIdentifier,
-  BoardError, DEFAULTS, UNIT_TEMPLATE, byBoardOrder, orderOf,
+  BoardError, DEFAULTS, UNIT_TEMPLATE, STATUSES, byBoardOrder, orderOf,
 };

@@ -51,11 +51,14 @@ function pageRouter() {
   router.delete('/cards/:ref', wrap(async (req, res) => { await B.archiveCard(req.params.ref); nudgeDots(); res.json({ ok: true }); }));
   router.post('/cards/:ref/tasks', wrap(async (req, res) => res.status(201).json(await B.addTask(req.params.ref, { name: req.body?.name, parentId: req.body?.parentId }, who(req)))));
 
-  // Tasks and subtasks: a status (with the dev), or a new name
+  // Tasks and subtasks: a status (with the dev; blocking takes a reason, and unblocking a resolution), or a new name
   router.patch('/items/:ref', wrap(async (req, res) => {
     let t = null;
     if ('name' in (req.body || {})) t = await B.renameTask(req.params.ref, req.body.name, who(req));
-    if ('status' in (req.body || {})) { t = await B.setStatus(req.params.ref, req.body.status, req.body.devId, who(req)); nudgeDots(); }
+    if ('status' in (req.body || {})) {
+      t = await B.setStatus(req.params.ref, req.body.status, req.body.devId, who(req), undefined, { reason: req.body.reason, resolution: req.body.resolution });
+      nudgeDots();
+    }
     if (!t) throw new B.BoardError(400, 'Send a status or a name');
     res.json({ ok: true, identifier: t.identifier, name: t.name, status: t.status });
   }));
@@ -104,7 +107,7 @@ function pageRouter() {
 
   router.get('/inbox', wrap(async (req, res) => res.json(await T.inbox())));
   router.post('/inbox/:id', wrap(async (req, res) => {
-    await T.decide(req.params.id, req.body?.decision, who(req), undefined, { devId: req.body?.devId });
+    await T.decide(req.params.id, req.body?.decision, who(req), undefined, { devId: req.body?.devId, reason: req.body?.reason, resolution: req.body?.resolution });
     if (req.body?.decision === 'apply') nudgeDots();
     res.json(await T.inbox());
   }));
@@ -118,6 +121,13 @@ async function settingsView() {
   const s = await B.settings();
   const all = await devs.overview();
   return { settings: s, channels: all.channels || [], reading: await T.watchList(), devPlaces: all.devs.filter(d => d.channelId).length, digest: await B.getMeta('digest') };
+}
+
+// Discord can't ask what unblocked a task, so a blocked one is moved on from the board.
+const DASHBOARD = () => (process.env.DASHBOARD_URL || 'https://lambent-lily-7bf643.netlify.app').replace(/\/+$/, '');
+function notBlocked(t) {
+  if (t.status !== 'blocked') return;
+  throw new B.BoardError(409, `${t.identifier} is blocked. Unblock it on the Assets board, where it asks what fixed it: ${DASHBOARD()}/assets/?item=${encodeURIComponent(t.identifier)}`);
 }
 
 function botRouter() {
@@ -139,14 +149,16 @@ function botRouter() {
   }));
   // Give a task to someone on Discord (added to the Developers tab if they aren't on it).
   router.post('/give', wrap(async (req, res) => {
-    const dev = await devs.forDiscord(req.body?.discordUserId, req.body?.name);
     const before = await B.findTask(req.body?.task);
+    notBlocked(before);
+    const dev = await devs.forDiscord(req.body?.discordUserId, req.body?.name);
     const t = await B.setStatus(before.id, 'in_progress', dev.id, req.body?.by);
     nudgeDots();
     res.json({ task: { identifier: t.identifier, label: `${t.cardName} › ${t.name}` }, dev: dev.name, was: before.devName && before.devId !== dev.id ? before.devName : null });
   }));
   router.post('/remove', wrap(async (req, res) => {
     const before = await B.findTask(req.body?.task);
+    notBlocked(before);
     if (before.status !== 'in_progress' && !before.devName) throw new B.BoardError(400, `${before.identifier} isn't anyone's`);
     const t = await B.setStatus(before.id, 'untasked', null, req.body?.by);
     nudgeDots();
