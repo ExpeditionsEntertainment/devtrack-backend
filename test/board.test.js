@@ -90,7 +90,7 @@ test('the one-time copy from Linear: cards, tasks, subtasks, statuses, devs, upd
   const icons = u.tasks.find(t => t.name === 'Icons');
   assert.deepEqual(icons.subtasks.map(s => [s.name, s.status, s.devName]), [['Equipment', 'done', 'Lyft'], ['Evo Item', 'done', 'Lyft']]);
   assert.deepEqual(u.tasks.find(t => t.name === 'Mesh').deliveries[0].files, ['rukia.fbx'], 'files sent to Linear are kept as a delivery');
-  assert.deepEqual(b.counts, { untasked: 3, in_progress: 2, done: 4, checkin: 1 });
+  assert.deepEqual(b.counts, { untasked: 3, in_progress: 2, blocked: 0, done: 4, checkin: 1 });
 
   const [old] = await prisma.$queryRawUnsafe(`SELECT title FROM "BoardTask" WHERE id = 'old-1'`);
   assert.equal(old.title, 'An old board task', 'the other feature\'s table is left alone');
@@ -329,4 +329,98 @@ test('the bot reads each dev\'s place and the channels picked; the dots know who
   const w = await B.working(prisma);
   assert.deepEqual(w.find(d => d.name === 'Ruku').tasks.map(t => t.label), ['Rukia › Texture']);
   assert.deepEqual(w.find(d => d.name === 'Lyft').tasks, []);
+});
+
+test('blocked: a reason to block, the dev kept, the top of the card, and a resolution to move it on', async () => {
+  const { prisma, L } = await setup();
+  const all = await devs.list(prisma);
+  const ruku = all.find(d => d.name === 'Ruku'), lyft = all.find(d => d.name === 'Lyft');
+  const started = rukiaOf(await B.board(prisma, NOW)).tasks.find(t => t.name === 'Texture').startedAt;
+
+  await assert.rejects(B.setStatus(L.texture.identifier, 'blocked', null, 'Alex', prisma), /what is blocking it/);
+  await assert.rejects(B.setStatus(L.texture.identifier, 'blocked', null, 'Alex', prisma, { reason: '   ' }), /what is blocking it/);
+  await B.setStatus(L.texture.identifier, 'blocked', null, 'Alex', prisma, { reason: 'Waiting on the  concept art' });
+  let b = await B.board(prisma, NOW);
+  let u = rukiaOf(b);
+  const tex = u.tasks.find(t => t.name === 'Texture');
+  assert.equal(tex.status, 'blocked');
+  assert.equal(tex.devName, 'Ruku', 'whoever was on it stays on it');
+  assert.deepEqual([tex.blocked.reason, tex.blocked.by, tex.blocked.from], ['Waiting on the concept art', 'Alex', 'in_progress']);
+  assert.equal(u.tasks[0].name, 'Texture', 'blocked goes to the top of its card');
+  assert.equal(tex.needsCheckin, false, 'nobody is chased for a check-in on a blocked task');
+  assert.deepEqual([b.counts.blocked, b.counts.in_progress, u.counts.blocked], [1, 1, 1]);
+  const rukuOut = b.devs.find(d => d.name === 'Ruku');
+  assert.deepEqual(rukuOut.blocked.map(x => [x.task, x.blocked.reason]), [['Texture', 'Waiting on the concept art']]);
+  assert.notEqual(rukuOut.state, 'working', 'blocked is not working');
+  assert.deepEqual((await B.tasksOf(ruku.id, prisma, NOW)).map(t => t.label)[0], 'Rukia › Texture', 'Send to Assets still offers it');
+  assert.deepEqual(await B.working(prisma).then(w => w.find(d => d.name === 'Ruku').tasks), [], 'their dot goes yellow');
+
+  // Blocking it again changes the reason; it's still one block.
+  await B.setStatus(L.texture.identifier, 'blocked', null, 'Alex', prisma, { reason: 'Waiting on the concept art from Sora' });
+  // Moving it on, to anything, needs what unblocked it.
+  await assert.rejects(B.setStatus(L.texture.identifier, 'in_progress', ruku.id, 'Alex', prisma), /is blocked: say what unblocked it/);
+  await assert.rejects(B.setStatus(L.texture.identifier, 'done', null, 'Alex', prisma, { resolution: ' ' }), /say what unblocked it/);
+  await assert.rejects(B.setStatus(L.texture.identifier, 'untasked', null, 'Alex', prisma), /say what unblocked it/);
+  assert.equal((await B.findTask(L.texture.identifier, prisma)).status, 'blocked', 'nothing changed');
+  await B.setStatus(L.texture.identifier, 'in_progress', ruku.id, 'Alex', prisma, { resolution: 'Sora sent the concept art' });
+  const back = rukiaOf(await B.board(prisma, NOW)).tasks.find(t => t.name === 'Texture');
+  assert.deepEqual([back.status, back.devName, back.blocked], ['in_progress', 'Ruku', null]);
+  assert.equal(new Date(back.startedAt).getTime(), new Date(started).getTime(), 'back to it: it keeps the day it was started');
+  const h = await B.history(L.texture.identifier, prisma);
+  assert.deepEqual(h.blocks.map(x => [x.reason, x.from, x.by, x.resolution, x.to, x.resolvedBy]),
+    [['Waiting on the concept art from Sora', 'in_progress', 'Alex', 'Sora sent the concept art', 'in_progress', 'Alex']]);
+  assert.deepEqual(h.events.map(e => [e.from, e.to]), [['blocked', 'in_progress'], ['in_progress', 'blocked']]);
+
+  // Something untasked can be blocked, with someone put on it; the work arriving by Send to Assets unblocks it.
+  await B.setStatus(L.aura.identifier, 'blocked', lyft.id, 'Alex', prisma, { reason: 'Needs the mesh first' });
+  assert.equal(rukiaOf(await B.board(prisma, NOW)).tasks.find(t => t.name === 'Aura').devName, 'Lyft');
+  const r = await B.deliver(L.aura.identifier, { url: 'https://discord.com/channels/1/2/9', devId: lyft.id, by: 'Alex' }, prisma);
+  assert.equal(r.was, 'blocked');
+  assert.equal(rukiaOf(await B.board(prisma, NOW)).tasks.find(t => t.name === 'Aura').status, 'done');
+  const ha = await B.history(L.aura.identifier, prisma);
+  assert.deepEqual([ha.blocks[0].resolution, ha.blocks[0].to], ['Sent to Assets by Lyft: https://discord.com/channels/1/2/9', 'done']);
+
+  // A deleted task takes its blocks with it.
+  await B.setStatus(L.shiny.identifier, 'blocked', null, 'Alex', prisma, { reason: 'Gold or silver?' });
+  await B.removeTask(L.shiny.identifier, prisma);
+  assert.equal((await prisma.$queryRawUnsafe(`SELECT count(*)::int AS n FROM "BoardBlock" WHERE "taskId" = $1`, L.shiny.id))[0].n, 0);
+});
+
+test('blocked from Discord: Claude suggests it, the reason comes with it, moving it on asks what unblocked it; the daily DM lists them', async () => {
+  const { prisma, L } = await setup();
+  const m1 = { id: '900000000000000031', channelId: '222222222222222222', place: 'ruku', authorId: '111111111111111111', authorName: 'Ruku',
+    content: "can't do the rukia shiny until I get the gold palette", url: 'https://discord.com/channels/1/2/31', postedAt: ago(0.2), attachments: [] };
+  await T.addMessage(m1, prisma);
+  let r = await T.triage(prisma, async () => ({ suggestions: [
+    { message_ids: [m1.id], issue: L.shiny.identifier, action: 'mark_blocked', dev: '', summary: 'Ruku is waiting on the gold palette for the Rukia shiny.', confidence: 'high' },
+    { message_ids: [m1.id], issue: L.mesh.identifier, action: 'mark_done', dev: '', summary: 'already done', confidence: 'low' }, // Done already: dropped
+  ] }));
+  assert.equal(r.suggestions, 1);
+  const [block] = (await T.inbox(prisma)).items;
+  assert.equal(block.action, 'mark_blocked');
+  await T.decide(block.id, 'apply', 'Alex', prisma);
+  let shiny = rukiaOf(await B.board(prisma, NOW)).tasks.find(t => t.name === 'Texture').subtasks[0];
+  assert.deepEqual([shiny.status, shiny.blocked.reason], ['blocked', 'Ruku is waiting on the gold palette for the Rukia shiny.']);
+  assert.match(T.boardText(await B.board(prisma, NOW)), /Texture › Shiny \| blocked \(Ruku is waiting on the gold palette/, 'Claude sees why');
+
+  // The daily DM lists what's blocked, with why.
+  const sent = [];
+  const d = await T.digest(prisma, async p => { sent.push(p); return true; }, new Date('2026-11-13T15:05:00Z'));
+  assert.equal(d.sent, true);
+  assert.deepEqual(sent[0].blocked.map(x => [x.unit, x.task, x.reason]), [['Rukia', 'Texture › Shiny', 'Ruku is waiting on the gold palette for the Rukia shiny.']]);
+  assert.match(sent[0].blocked[0].url, /\/assets\/\?item=ASS-\d+$/);
+  assert.match(sent[0].blockedUrl, /\/assets\/\?show=blocked$/);
+
+  const m2 = { ...m1, id: '900000000000000032', content: 'got the palette, back on the shiny', url: 'https://discord.com/channels/1/2/32' };
+  await T.addMessage(m2, prisma);
+  await T.triage(prisma, async () => ({ suggestions: [
+    { message_ids: [m2.id], issue: L.shiny.identifier, action: 'mark_in_progress', dev: 'Ruku', summary: 'Ruku got the gold palette and is back on the Rukia shiny.', confidence: 'high' },
+  ] }));
+  const [go] = (await T.inbox(prisma)).items;
+  await assert.rejects(T.decide(go.id, 'apply', 'Alex', prisma), /say what unblocked it/);
+  assert.equal((await T.inbox(prisma)).items.length, 1, 'still there to apply');
+  await T.decide(go.id, 'apply', 'Alex', prisma, { resolution: 'Ruku got the gold palette' });
+  shiny = rukiaOf(await B.board(prisma, NOW)).tasks.find(t => t.name === 'Texture').subtasks[0];
+  assert.deepEqual([shiny.status, shiny.devName], ['in_progress', 'Ruku']);
+  assert.equal((await B.history(L.shiny.identifier, prisma)).blocks[0].resolution, 'Ruku got the gold palette');
 });
