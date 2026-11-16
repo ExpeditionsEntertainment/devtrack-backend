@@ -70,17 +70,21 @@ function pageRouter() {
   }));
   router.get('/items/:ref/history', wrap(async (req, res) => res.json(await B.history(req.params.ref))));
 
-  // Ask the dev how it's going: a DM from the bot (or in their place on Discord if DMs are closed).
+  // Ask the dev how it's going: a message in their place on Discord (their channel on the Developers
+  // tab), mentioning them. Not a DM.
   router.post('/items/:ref/ping', wrap(async (req, res) => {
     const b = await B.board();
-    const all = b.cards.flatMap(u => u.tasks.flatMap(t => [t, ...t.subtasks].map(x => ({ unit: u, task: t, x }))));
+    const all = b.cards.flatMap(u => u.tasks.flatMap(t => [t, ...t.subtasks].map(a => ({ unit: u, task: t, x: a }))));
     const hit = all.find(a => a.x.identifier === req.params.ref || a.x.id === req.params.ref);
     if (!hit) throw new B.BoardError(404, 'No such task');
     const dev = hit.x.dev;
-    if (!dev?.discordUserId && !dev?.channelId) throw new B.BoardError(400, `${hit.x.devName || 'Nobody'} has no Discord account or place on the Developers tab`);
+    if (!dev) throw new B.BoardError(400, `${hit.x.devName || 'Nobody'} is not on the Developers tab`);
+    if (!dev.channelId) throw new B.BoardError(400, `${dev.name} has no channel on the Developers tab to ask in. Pick one with Edit on their card.`);
     const what = hit.x === hit.task ? hit.task.name : `${hit.task.name} (${hit.x.name})`;
     const text = String(req.body?.text || '').trim() || `Hey! How's the **${what}** for **${hit.unit.name}** going? Any update or a WIP shot you can share?`;
-    const sent = await notifier.boardPing({ userId: dev.discordUserId, channelId: dev.channelId, text: text.slice(0, 1800), from: who(req) });
+    const sent = await notifier.boardPing({
+      userId: dev.discordUserId, channelId: dev.channelId, text: text.slice(0, 1800), from: who(req), card: hit.unit.name, task: hit.task.name,
+    });
     await B.addActivity(hit.x.id, 'ping', { text, by: who(req) });
     res.json({ ok: true, queued: !sent });
   }));
