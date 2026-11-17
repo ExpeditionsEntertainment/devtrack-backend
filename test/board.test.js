@@ -424,3 +424,33 @@ test('blocked from Discord: Claude suggests it, the reason comes with it, moving
   assert.deepEqual([shiny.status, shiny.devName], ['in_progress', 'Ruku']);
   assert.equal((await B.history(L.shiny.identifier, prisma)).blocks[0].resolution, 'Ruku got the gold palette');
 });
+
+test('the progress channel on Discord: cards by update with tasks in the template order, who is on what, what is blocked, who is free', async () => {
+  process.env.RAILWAY_PUBLIC_DOMAIN = 'api.example.com';
+  try {
+    const { prisma, L } = await setup();
+    const lyft = (await devs.list(prisma)).find(d => d.name === 'Lyft');
+    await B.setStatus(L.aura.identifier, 'blocked', lyft.id, 'Alex', prisma, { reason: 'Needs the mesh' });
+    await B.addImage({ issueId: rukiaOf(await B.board(prisma, NOW)).id, kind: 'base', data: PNG }, prisma);
+    await B.createCard({ name: 'Lobby props', kind: 'other' }, 'Alex', prisma);
+    const p = await B.progress(prisma, NOW);
+
+    assert.deepEqual(p.updates.map(u => [u.name, u.cards.map(c => c.name)]), [['Winter Update [6.0]', ['Rukia']], [null, ['Lobby props']]],
+      'cards in no update come last');
+    const rukia = p.updates[0].cards[0];
+    assert.deepEqual(rukia.tasks.map(t => t.name), ['Animations', 'Mesh', 'Texture', 'Aura', 'Icons', 'VFX'], 'the template order, not the page\'s blocked-first sort');
+    assert.match(rukia.image, /^https:\/\/api\.example\.com\/api\/board\/img\/[\w-]+\?s=[\w-]+$/, 'an image link Discord can fetch');
+    assert.deepEqual(rukia.tasks.find(t => t.name === 'Texture').subtasks.map(s => [s.name, s.status]), [['Shiny', 'untasked']]);
+    const aura = rukia.tasks.find(t => t.name === 'Aura');
+    assert.deepEqual([aura.status, aura.dev.name, aura.blocked.reason], ['blocked', 'Lyft', 'Needs the mesh']);
+    assert.deepEqual([rukia.counts.done, rukia.counts.blocked, rukia.counts.total], [4, 1, 9]);
+    assert.equal(p.updates[1].cards[0].counts.total, 0);
+
+    assert.deepEqual(p.working.map(d => [d.name, d.tasks.map(t => `${t.card} › ${t.task}`)]), [['Mauwiscool', ['Rukia › VFX']], ['Ruku', ['Rukia › Texture']]]);
+    assert.deepEqual(p.blocked.map(x => [x.card, x.task, x.dev, x.reason]), [['Rukia', 'Aura', 'Lyft', 'Needs the mesh']]);
+    assert.deepEqual(p.free, ['Lyft'], 'nothing in progress and seen lately; the ones working are not free');
+    assert.ok(Date.parse(p.changedAt) >= Date.parse(rukia.changedAt), 'the last change on the board');
+  } finally {
+    delete process.env.RAILWAY_PUBLIC_DOMAIN;
+  }
+});
