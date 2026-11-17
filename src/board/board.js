@@ -327,7 +327,7 @@ async function board(prisma = getPrisma(), now = new Date()) {
     return {
       id: c.id, identifier: c.identifier, name: c.name, kind: c.kind,
       update: c.updateId && updateName.has(c.updateId) ? { id: c.updateId, name: updateName.get(c.updateId) } : null,
-      rarity: c.rarity || null, element: c.element || null, notionUrl: c.notionUrl || null, createdAt: c.createdAt,
+      rarity: c.rarity || null, element: c.element || null, notionUrl: c.notionUrl || null, createdAt: c.createdAt, updatedAt: c.updatedAt,
       baseImage: cardImages.filter(im => im.kind === 'base').at(-1) || null,
       images: cardImages.filter(im => im.kind === 'ref'), notes: notes.get(c.id)?.text || '',
       tasks,
@@ -667,7 +667,70 @@ async function working(prisma = getPrisma()) {
   return list.map(d => ({ ...d, tasks: all.filter(t => t.devId === d.id && t.status === 'in_progress').map(pick) }));
 }
 
+// ── the progress channel on Discord ──
+
+// The backend's public address, for links Discord fetches itself (a card's image).
+const publicBase = () => (process.env.PUBLIC_API_URL
+  || (process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` : '')).replace(/\/+$/, '');
+
+// What the bot shows in the progress channel: the cards by game update, each with its tasks in the
+// template's order (Animations, Mesh, Texture...) and who's on them, then who's working on what,
+// what's blocked and who's free. Times are ISO strings; changedAt is the last change, so the bot
+// only edits a message when something on it changed.
+async function progress(prisma = getPrisma(), now = new Date()) {
+  const b = await board(prisma, now);
+  const base = publicBase();
+  const iso = d => (d ? new Date(d).toISOString() : null);
+  const latest = list => iso(list.filter(Boolean).map(d => new Date(d)).sort((x, y) => y - x)[0]);
+  const pipeline = (x, y) => orderOf(x.name) - orderOf(y.name) || x.name.localeCompare(y.name) || String(x.createdAt).localeCompare(String(y.createdAt));
+  const item = x => ({
+    identifier: x.identifier, name: x.name, status: x.status,
+    dev: x.devName ? { name: x.dev?.name || x.devName, discordUserId: x.dev?.discordUserId || null } : null,
+    startedAt: iso(x.startedAt), completedAt: iso(x.completedAt),
+    blocked: x.blocked ? { reason: x.blocked.reason, since: iso(x.blocked.since) } : null,
+  });
+  const cards = b.cards.map(c => {
+    const all = c.tasks.flatMap(t => [t, ...t.subtasks]);
+    return {
+      identifier: c.identifier, name: c.name, kind: c.kind, rarity: c.rarity, element: c.element, updateId: c.update?.id || null,
+      image: c.baseImage && base ? `${base}${c.baseImage.url}` : null,
+      counts: c.counts,
+      changedAt: latest([c.updatedAt, c.createdAt, ...all.map(x => x.updatedAt)]),
+      tasks: [...c.tasks].sort(pipeline).map(t => ({ ...item(t), subtasks: [...t.subtasks].sort(pipeline).map(item) })),
+    };
+  });
+  const groups = [...b.updates.map(u => ({ id: u.id, name: u.name })), { id: null, name: null }]
+    .map(u => ({ ...u, cards: cards.filter(c => c.updateId === u.id) }))
+    .filter(u => u.cards.length);
+
+  // Who's on what: everything in progress, by dev (the name on the task, if they're not on the Developers tab).
+  const label = (t, x) => (x === t ? t.name : `${t.name} › ${x.name}`);
+  const flat = b.cards.flatMap(c => c.tasks.flatMap(t => [t, ...t.subtasks].map(x => ({ c, t, x }))));
+  const byDev = new Map();
+  for (const { c, t, x } of flat.filter(a => a.x.status === 'in_progress')) {
+    const name = x.dev?.name || x.devName || 'Nobody named';
+    if (!byDev.has(name)) byDev.set(name, { name, discordUserId: x.dev?.discordUserId || null, tasks: [] });
+    byDev.get(name).tasks.push({ identifier: x.identifier, card: c.name, task: label(t, x), startedAt: iso(x.startedAt) });
+  }
+  for (const d of byDev.values()) d.tasks.sort((p, q) => String(p.startedAt).localeCompare(String(q.startedAt)));
+  const working = [...byDev.values()].sort((p, q) => q.tasks.length - p.tasks.length || p.name.localeCompare(q.name));
+  const blocked = flat.filter(a => a.x.status === 'blocked').map(({ c, t, x }) => ({
+    identifier: x.identifier, card: c.name, task: label(t, x), dev: x.dev?.name || x.devName || null,
+    reason: x.blocked?.reason || '', since: iso(x.blocked?.since),
+  })).sort((p, q) => String(p.since).localeCompare(String(q.since)));
+
+  return {
+    updates: groups.map(g => ({ ...g, cards: g.cards.map(({ updateId, ...c }) => c) })),
+    counts: b.counts,
+    working,
+    blocked,
+    free: b.devs.filter(d => d.state === 'free').map(d => d.name).sort((p, q) => p.localeCompare(q)),
+    changedAt: latest(cards.map(c => c.changedAt)),
+  };
+}
+
 module.exports = {
+  progress,
   ensureSchema, settings, setSettings, getMeta, setMeta, start, board, roster, findTask, findCard, idOf,
   setStatus, renameTask, addTask, removeTask, createCard, updateCard, archiveCard,
   createUpdate, renameUpdate, removeUpdate, deliver, removeDelivery, deliveriesOf, history, search, tasksOf, working,

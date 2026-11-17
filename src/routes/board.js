@@ -3,7 +3,7 @@
 //                    check-ins, the list of updates from Discord, settings
 //   /api/board/img   an image, by its signed link (no sign-in, so <img> can show it)
 //   /api/bot/board   the bot: which channels to read, the messages, and /assets, Give task and
-//                    Send to Assets from Discord
+//                    Send to Assets from Discord, and what the progress channel shows
 
 const express = require('express');
 const axios = require('axios');
@@ -27,6 +27,17 @@ function nudgeDots() {
     .catch(err => console.error('[Board] Could not nudge the bot:', err.code || err.message));
 }
 
+// The progress channel on Discord shows the board as cards: after anything that changes the board,
+// the bot reads it again (it waits a few seconds, so a burst of changes is one redraw).
+function nudgeProgress() {
+  axios.post(`${process.env.BOT_WEBHOOK_URL || 'http://localhost:3002'}/board-progress`, {}, { headers: { 'x-bot-secret': process.env.BOT_SECRET }, timeout: 5000 })
+    .catch(err => console.error('[Board] Could not nudge the progress channel:', err.code || err.message));
+}
+const afterChange = (skip = []) => (req, res, next) => {
+  if (req.method !== 'GET' && !skip.includes(req.path)) res.on('finish', () => { if (res.statusCode < 400) nudgeProgress(); });
+  next();
+};
+
 function pageRouter() {
   const router = express.Router();
   // Images first: they're fetched by <img>, which can't sign in; the link itself is signed.
@@ -37,6 +48,7 @@ function pageRouter() {
     res.send(data);
   }));
   router.use(auth, requireRole('admin'));
+  router.use(afterChange());
 
   router.get('/', wrap(async (req, res) => res.json(await B.board())));
 
@@ -141,7 +153,10 @@ function botRouter() {
     next();
   });
   router.use(express.json({ limit: '1mb' }));
+  router.use(afterChange(['/messages'])); // a message from Discord is only read; it changes nothing yet
   router.get('/watch', wrap(async (req, res) => res.json({ channelIds: await T.watchList() })));
+  // The progress channel: what it shows.
+  router.get('/progress', wrap(async (req, res) => res.json(await B.progress())));
   router.post('/messages', wrap(async (req, res) => res.json(await T.addMessage(req.body || {}))));
 
   // /assets and the right-click menus.
