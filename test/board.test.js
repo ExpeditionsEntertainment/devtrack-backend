@@ -424,3 +424,26 @@ test('blocked from Discord: Claude suggests it, the reason comes with it, moving
   assert.deepEqual([shiny.status, shiny.devName], ['in_progress', 'Ruku']);
   assert.equal((await B.history(L.shiny.identifier, prisma)).blocks[0].resolution, 'Ruku got the gold palette');
 });
+
+test('Misc. cards: anything that isn\'t a unit (a mount, a pet), with what it is, its own tasks, and moving between the tabs', async () => {
+  const { prisma } = await setup();
+  const upd = (await B.board(prisma, NOW)).updates[0];
+  const mount = await B.createCard({ name: 'Frost Wolf', kind: 'misc', category: '  Mount ', updateId: upd.id, tasks: [{ name: 'Mesh' }, { name: 'Animations', subtasks: ['Idle', 'Run'] }] }, 'Alex', prisma);
+  let b = await B.board(prisma, NOW);
+  let wolf = b.cards.find(c => c.id === mount.id);
+  assert.deepEqual([wolf.kind, wolf.category, wolf.update.name], ['misc', 'Mount', 'Winter Update [6.0]']);
+  assert.deepEqual(wolf.tasks.map(t => [t.name, t.subtasks.map(s => s.name)]), [['Animations', ['Idle', 'Run']], ['Mesh', []]], 'only the tasks it was given');
+  assert.equal((await B.createCard({ name: 'Snow Fox', kind: 'misc' }, 'Alex', prisma)).identifier.startsWith('ASS-'), true);
+  assert.equal(b.cards.find(c => c.name === 'Rukia').kind, 'unit');
+  assert.equal((await B.createCard({ name: 'Lobby props', kind: 'other' }, 'Alex', prisma)).kind, 'misc', 'what the page used to call "Something else"');
+  assert.equal((await B.createCard({ name: 'Doumo' }, 'Alex', prisma)).kind, 'unit', 'a card is a unit unless it says otherwise');
+
+  // A card can move between the Board and Misc., and say what it is.
+  await B.updateCard(mount.identifier, { kind: 'unit', category: '' }, prisma);
+  wolf = (await B.board(prisma, NOW)).cards.find(c => c.id === mount.id);
+  assert.deepEqual([wolf.kind, wolf.category], ['unit', null]);
+  await B.updateCard(mount.identifier, { kind: 'misc', category: 'Pet' }, prisma);
+  wolf = (await B.board(prisma, NOW)).cards.find(c => c.id === mount.id);
+  assert.deepEqual([wolf.kind, wolf.category], ['misc', 'Pet']);
+  assert.equal(wolf.tasks.length, 2, 'moving keeps its tasks');
+});
