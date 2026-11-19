@@ -25,6 +25,18 @@ scale = float(plan.get('scale', 0.01))
 show_everything()
 by_name = {o.name: o for o in parts()}
 
+# The parts of a weapon in the unit's own file are set aside first, so naming the body can't touch
+# them; accessories.py moves them where the page put them and names them "A1 <part>".
+held = {}
+for acc in plan.get('accessories', []):
+    if not acc.get('inFile'):
+        continue
+    for name in acc['meshes']:
+        o = by_name.pop(name, None)
+        if o is None:
+            raise SystemExit(f"Weapon {acc['prefix']}: could not find the part {name}")
+        held[name] = o
+
 for name in drop:
     o = by_name.pop(name, None)
     if o:
@@ -52,7 +64,7 @@ if missing:
 # Weapons and other accessories, each where it was put on the page (accessories.py).
 if plan.get('accessories'):
     from accessories import add_accessories
-    add_accessories(plan['accessories'])
+    add_accessories(plan['accessories'], held)
 
 # Bones and weights for the parts that bend (rig.py).
 if plan.get('rigs'):
