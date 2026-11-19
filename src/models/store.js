@@ -15,8 +15,8 @@
 // it sits, saved from the page). At export Blender adds its meshes to the
 // unit's FBX at that spot, named "A<n> <mesh>", plus a marker "A<n> Handle"
 // where the hand grips; the Mac turns those into the Cid structure (a Model
-// under the limb with a Handle part, a Motor6D to each mesh and a Weld from
-// the limb to the Handle).
+// under the limb with a Handle part, a Motor6D from the limb to the Handle so
+// animations can move it, and a Weld from the Handle to each mesh).
 // A weapon can also be in the unit's own file: an accessory row whose model is the unit itself
 // ("in the file"), with its parts picked on the page (each part's category is "weapon:<its id>").
 // It's positioned the same way, from where it sits in the file, and exported the same way: its
