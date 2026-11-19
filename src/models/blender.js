@@ -75,15 +75,21 @@ async function withTemp(fn) {
   try { return await fn(dir); } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 }
 
-// .blend (or .fbx) in, { glb, parts, blender } out.
-function inspect(blend, format = 'blend') {
+// .blend (or .fbx) in, { glb, parts, blender, splits } out. splits: parts to cut into their loose pieces first.
+function inspect(blend, format = 'blend', splits = []) {
   return withTemp(async dir => {
     const file = path.join(dir, format === 'fbx' ? 'model.fbx' : 'model.blend');
     fs.writeFileSync(file, blend);
     const glb = path.join(dir, 'model.glb');
     const meta = path.join(dir, 'model.json');
+    const extra = [];
+    if (splits?.length) {
+      const list = path.join(dir, 'splits.json');
+      fs.writeFileSync(list, JSON.stringify(splits));
+      extra.push(`splits=${list}`);
+    }
     if (format === 'fbx') await run(null, 'inspect.py', [glb, meta, file]);
-    else await run(file, 'inspect.py', [glb, meta]);
+    else await run(file, 'inspect.py', [glb, meta, ...extra]);
     const info = JSON.parse(fs.readFileSync(meta, 'utf8'));
     // config, skinned, armatures, bones: what a rigged .blend (edited and uploaded back) holds
     return { ...info, glb: fs.readFileSync(glb) };
