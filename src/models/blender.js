@@ -106,6 +106,7 @@ function runExport(blend, plan, outName) {
     const file = path.join(dir, 'model.blend');
     fs.writeFileSync(file, blend);
     const accessories = (plan.accessories || []).map((a, i) => {
+      if (a.inFile) return a; // a weapon in the unit's own file: nothing to bring in
       const accFile = path.join(dir, `accessory${i + 1}.${a.format === 'fbx' ? 'fbx' : 'blend'}`);
       fs.writeFileSync(accFile, a.data);
       const { data, ...rest } = a;

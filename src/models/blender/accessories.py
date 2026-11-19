@@ -5,6 +5,9 @@
 #     matrix: 16 numbers, column-major: where the page put it, in the viewer's
 #             (glTF) space,
 #     handle: [x, y, z]: where the hand grips, in the same space }
+# or, for a weapon that's in the unit's own file,
+#   { prefix, inFile: true, meshes: [the unit's parts that make it up], matrix, handle }
+# where the matrix moves those parts from where they are in the file.
 #
 # Its meshes come in named "A1 <name>" and placed exactly as they were on the
 # page, and a small cube "A1 Handle" marks the grip. In Studio the Mac turns
@@ -58,13 +61,18 @@ def _add(acc, unit_height):
     for o in new:
         if o not in meshes:
             bpy.data.objects.remove(o, do_unlink=True)
+    _place(acc, [(o, o.name) for o in meshes], where, unit_height)
 
+
+def _place(acc, meshes, where, unit_height):
+    """Move each (object, its name) by where the page put the accessory, name it "A1 <name>",
+    and add the Handle marker."""
     m = acc['matrix']
     placed = Matrix([[m[0], m[4], m[8], m[12]], [m[1], m[5], m[9], m[13]], [m[2], m[6], m[10], m[14]], [m[3], m[7], m[11], m[15]]])
     move = FROM_GLTF @ placed @ TO_GLTF
-    for o in meshes:
+    for o, name in meshes:
         o.matrix_world = move @ where[o]
-        o.name = f"{acc['prefix']} {o.name}"
+        o.name = f"{acc['prefix']} {name}"
         if o.data and o.data.users == 1:
             o.data.name = o.name
 
@@ -75,14 +83,33 @@ def _add(acc, unit_height):
     marker.data.name = marker.name
 
 
-def add_accessories(accessories):
+def _add_in_file(acc, held, unit_height):
+    """A weapon made of the unit's own parts: freed from the body (and anything parented to it that
+    isn't part of the weapon stays where it is), then placed like any other."""
+    meshes = [(held[name], name) for name in acc['meshes']]
+    mine = {o for o, _ in meshes}
+    stay = [o for o in bpy.data.objects if o.parent in mine and o not in mine]
+    where = {o: o.matrix_world.copy() for o in [*mine, *stay]}
+    for o in [*stay, *mine]:
+        o.parent = None
+        o.matrix_world = where[o]
+    _place(acc, meshes, where, unit_height)
+
+
+def add_accessories(accessories, held=None):
+    """held: the parts of in-file weapons, by their name in the file (set aside by export.py)."""
+    held = held or {}
+    corners = [o.matrix_world @ Vector(c) for o in bpy.data.objects if o.type == 'MESH' for c in o.bound_box]
+    height = (max(c.z for c in corners) - min(c.z for c in corners)) if corners else 1.0
     # The unit's own objects step aside while files come in, so nothing gets renamed "Head.001".
     unit = [(o, o.name) for o in bpy.data.objects]
     for i, (o, _) in enumerate(unit):
         o.name = f'__dt_unit_{i}'
-    corners = [o.matrix_world @ Vector(c) for o, _ in unit if o.type == 'MESH' for c in o.bound_box]
-    height = (max(c.z for c in corners) - min(c.z for c in corners)) if corners else 1.0
     for acc in accessories:
-        _add(acc, height)
+        if not acc.get('inFile'):
+            _add(acc, height)
     for o, name in unit:
         o.name = name
+    for acc in accessories:
+        if acc.get('inFile'):
+            _add_in_file(acc, held, height)

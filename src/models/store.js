@@ -17,6 +17,10 @@
 // where the hand grips; the Mac turns those into the Cid structure (a Model
 // under the limb with a Handle part, a Motor6D to each mesh and a Weld from
 // the limb to the Handle).
+// A weapon can also be in the unit's own file: an accessory row whose model is the unit itself
+// ("in the file"), with its parts picked on the page (each part's category is "weapon:<its id>").
+// It's positioned the same way, from where it sits in the file, and exported the same way: its
+// parts are taken out of the body, moved, and named "A<n> <part>", with the Handle marker.
 //
 // Bending parts (wings, capes, hair): the body stays R6, welded; an accessory part can be given
 // a bone chain ("rigs", per part: kind, bones per chain, chains, smooth, and each chain's root and
@@ -48,6 +52,9 @@ const PRIMARY = ['Head', 'Torso', 'Right Arm', 'Left Arm', 'Right Leg', 'Left Le
 const SECONDARY = PRIMARY.map(p => `${p} Accessory`);
 const DROP = 'drop';
 const CATEGORIES = [...PRIMARY, ...SECONDARY];
+// A part of a weapon in the unit's own file: "weapon:<the accessory's id>".
+const WEAPON = 'weapon:';
+const weaponOf = cat => (typeof cat === 'string' && cat.startsWith(WEAPON) ? cat.slice(WEAPON.length) : null);
 // The mesh name each body category gets in Studio (a finished unit's house style).
 const MESH_NAME = { Head: 'Head', Torso: 'Torso', 'Right Arm': 'ArmRight', 'Left Arm': 'ArmLeft', 'Right Leg': 'LegRight', 'Left Leg': 'LegLeft' };
 const FROM_MESH_NAME = Object.fromEntries(Object.entries(MESH_NAME).map(([k, v]) => [v.toLowerCase(), k]));
@@ -165,7 +172,9 @@ function checkLabels(parts, labels) {
   return clean;
 }
 
-function checkAssignments(parts, assignments) {
+// weapons: the ids of the unit's weapons in its own file. A part on one that no longer exists (taken
+// apart, then undone on the page) is just left unnamed.
+function checkAssignments(parts, assignments, weapons = new Set()) {
   if (!assignments || typeof assignments !== 'object' || Array.isArray(assignments)) throw new ModelError(400, 'assignments must be an object');
   const names = new Set(parts.map(p => p.name));
   const clean = {};
@@ -173,6 +182,10 @@ function checkAssignments(parts, assignments) {
   for (const [part, cat] of Object.entries(assignments)) {
     if (!names.has(part)) throw new ModelError(400, `No part called "${part}"`);
     if (cat === null || cat === '') continue;
+    if (weaponOf(cat) !== null) {
+      if (weapons.has(weaponOf(cat))) clean[part] = cat;
+      continue;
+    }
     if (cat !== DROP && !CATEGORIES.includes(cat)) throw new ModelError(400, `"${cat}" is not a category`);
     if (PRIMARY.includes(cat)) {
       if (primaryOwner[cat]) throw new ModelError(400, `${cat} is on both "${primaryOwner[cat]}" and "${part}"`);
@@ -295,7 +308,7 @@ async function file(id, column, prisma = getPrisma()) {
 async function setAssignments(id, assignments, prisma = getPrisma(), labels, doubleSided, rigs) {
   const model = await get(id, prisma);
   if (model.status !== 'ready') throw new ModelError(409, 'The model is not ready yet');
-  const clean = checkAssignments(model.parts, assignments);
+  const clean = checkAssignments(model.parts, assignments, new Set(model.accessories.filter(a => a.inFile).map(a => a.id)));
   const words = labels === undefined ? model.labels : checkLabels(model.parts, labels);
   let both = model.doubleSided;
   if (doubleSided !== undefined) {
@@ -377,25 +390,33 @@ function rigPlan(model, steps) {
 // used while this is still the same, so a file made before a change can't quietly undo it.
 function configHash(model, accs) {
   const steps = plan(model.parts, model.assignments, model.labels);
-  const cfg = { rename: steps.rename, drop: steps.drop, rigs: rigPlan(model, steps), acc: (accs || []).map(a => [a.accessoryId, a.name, a.spot, a.placement]) };
+  const cfg = { rename: steps.rename, drop: steps.drop, rigs: rigPlan(model, steps), acc: (accs || []).map(a => [a.accessoryId, a.name, a.spot, a.placement, ...(a.inFile ? [a.parts] : [])]) };
   return require('crypto').createHash('sha1').update(JSON.stringify(cfg)).digest('hex').slice(0, 12);
 }
 
 // ── weapons and other accessories ──
 
+// Each accessory on a unit. One in the unit's own file (inFile) lists its parts, in the file's order.
 async function accessoriesOf(unitId, prisma) {
   const rows = await prisma.$queryRawUnsafe(`SELECT a.id, a."accessoryId", a.name, a.spot, a.placement, a."doubleSided", m.name AS "fileName", m.status,
       m.error, m.parts, m.assignments FROM "ModelAccessory" a LEFT JOIN "ModelFile" m ON m.id = a."accessoryId"
     WHERE a."unitId" = $1 ORDER BY a."createdAt"`, unitId);
-  return rows.map(r => ({
-    id: r.id, accessoryId: r.accessoryId, name: r.name, spot: r.spot, limb: SPOTS[r.spot], placement: json(r.placement), doubleSided: !!r.doubleSided,
-    file: r.fileName ? { name: r.fileName, status: r.status, error: r.error, parts: (json(r.parts) || []).length } : null,
-  }));
+  return rows.map(r => {
+    const inFile = r.accessoryId === unitId;
+    const parts = json(r.parts) || [];
+    const asg = json(r.assignments) || {};
+    return {
+      id: r.id, accessoryId: r.accessoryId, name: r.name, spot: r.spot, limb: SPOTS[r.spot], placement: json(r.placement), doubleSided: !!r.doubleSided,
+      file: r.fileName ? { name: r.fileName, status: r.status, error: r.error, parts: parts.length } : null,
+      ...(inFile ? { inFile: true, parts: parts.filter(p => asg[p.name] === WEAPON + r.id).map(p => p.name) } : {}),
+    };
+  });
 }
 
+// The units a model is attached to as an accessory (not counting a weapon in a unit's own file).
 async function attachedTo(accessoryId, prisma) {
   return prisma.$queryRawUnsafe(`SELECT a.id, a."unitId", m.name FROM "ModelAccessory" a JOIN "ModelFile" m ON m.id = a."unitId"
-    WHERE a."accessoryId" = $1 ORDER BY a."createdAt"`, accessoryId);
+    WHERE a."accessoryId" = $1 AND a."unitId" <> a."accessoryId" ORDER BY a."createdAt"`, accessoryId);
 }
 
 const accessoryName = v => String(v ?? '').replace(/\.(blend\d*|fbx)$/i, '').replace(/[_]+/g, ' ').replace(/[^\p{L}\p{N} '()-]+/gu, '').replace(/\s+/g, ' ').trim().slice(0, 60);
@@ -409,16 +430,25 @@ function checkPlacement(p) {
   return { matrix: p.matrix, handle: p.handle };
 }
 
+// accessoryId: another model, or the unit itself for a weapon in its own file (its parts are picked after).
 async function addAccessory(unitId, { accessoryId, name, spot = 'right-hand' } = {}, prisma = getPrisma()) {
   await ensureSchema(prisma);
-  if (accessoryId === unitId) throw new ModelError(400, 'A model can\'t be its own accessory');
-  const [unit] = await prisma.$queryRawUnsafe(`SELECT id FROM "ModelFile" WHERE id = $1`, unitId);
+  const [unit] = await prisma.$queryRawUnsafe(`SELECT id, format FROM "ModelFile" WHERE id = $1`, unitId);
   const [acc] = await prisma.$queryRawUnsafe(`SELECT id, name FROM "ModelFile" WHERE id = $1`, accessoryId);
   if (!unit || !acc) throw new ModelError(404, 'No such model');
   if (!SPOTS[spot]) throw new ModelError(400, `spot must be one of ${Object.keys(SPOTS).join(', ')}`);
+  const inFile = accessoryId === unitId;
+  if (inFile && unit.format === 'fbx') throw new ModelError(400, 'Only a unit opened from a .blend can have a weapon in its own file');
+  let label = accessoryName(name) || (inFile ? 'Weapon' : accessoryName(acc.name)) || 'Accessory';
+  if (inFile) {
+    // A second weapon in the same file gets its own name: "Weapon 2".
+    const taken = new Set((await accessoriesOf(unitId, prisma)).map(a => a.name.toLowerCase()));
+    const base = label;
+    for (let n = 2; taken.has(label.toLowerCase()); n++) label = `${base} ${n}`;
+  }
   const id = newId();
   await prisma.$executeRawUnsafe(`INSERT INTO "ModelAccessory" (id, "unitId", "accessoryId", name, spot) VALUES ($1, $2, $3, $4, $5)`,
-    id, unitId, accessoryId, accessoryName(name) || accessoryName(acc.name) || 'Accessory', spot);
+    id, unitId, accessoryId, label, spot);
   return (await accessoriesOf(unitId, prisma)).find(a => a.id === id);
 }
 
@@ -445,28 +475,50 @@ async function updateAccessory(unitId, id, body = {}, prisma = getPrisma()) {
   return (await accessoriesOf(unitId, prisma)).find(a => a.id === id);
 }
 
+// Taking a weapon in the unit's own file apart puts its parts back to not named.
 async function removeAccessory(unitId, id, prisma = getPrisma()) {
   await ensureSchema(prisma);
+  const [row] = await prisma.$queryRawUnsafe(`SELECT "accessoryId" FROM "ModelAccessory" WHERE id = $1 AND "unitId" = $2`, id, unitId);
   await prisma.$executeRawUnsafe(`DELETE FROM "ModelAccessory" WHERE id = $1 AND "unitId" = $2`, id, unitId);
+  if (row?.accessoryId !== unitId) return;
+  const [m] = await prisma.$queryRawUnsafe(`SELECT assignments FROM "ModelFile" WHERE id = $1`, unitId);
+  const asg = json(m?.assignments) || {};
+  const left = Object.fromEntries(Object.entries(asg).filter(([, cat]) => cat !== WEAPON + id));
+  if (Object.keys(left).length !== Object.keys(asg).length) {
+    await prisma.$executeRawUnsafe(`UPDATE "ModelFile" SET assignments = $2::jsonb, "updatedAt" = now() WHERE id = $1`, unitId, JSON.stringify(left));
+  }
 }
 
 // What Blender needs to add a unit's accessories to its FBX, and what the Mac needs to build them.
+// inFile: each part of a weapon in the unit's own file, by the name it gets in the FBX ("A1 Blade").
 async function accessoryExport(unitId, prisma) {
   const accs = await accessoriesOf(unitId, prisma);
   const forBlender = [];
   const forStudio = [];
+  const inFile = {};
   for (const [i, a] of accs.entries()) {
-    if (a.file?.status !== 'ready') throw new ModelError(409, `The accessory ${a.name} is not ready yet`);
-    if (!a.placement) throw new ModelError(409, `Position ${a.name} on the unit first (Position on the page)`);
-    const [m] = await prisma.$queryRawUnsafe(`SELECT blend, format, parts, assignments FROM "ModelFile" WHERE id = $1`, a.accessoryId);
-    const left = json(m.assignments) || {};
-    const meshes = (json(m.parts) || []).filter(p => left[p.name] !== DROP && p.verts > 0).map(p => p.name);
-    if (!meshes.length) throw new ModelError(409, `The accessory ${a.name} has no meshes to add`);
     const prefix = `A${i + 1}`;
-    forBlender.push({ prefix, data: Buffer.from(m.blend), format: m.format || 'blend', meshes, matrix: a.placement.matrix, handle: a.placement.handle });
+    let meshes;
+    if (a.inFile) {
+      const [m] = await prisma.$queryRawUnsafe(`SELECT parts FROM "ModelFile" WHERE id = $1`, unitId);
+      const mine = new Set(a.parts);
+      meshes = (json(m.parts) || []).filter(p => mine.has(p.name) && p.verts > 0).map(p => p.name);
+      if (!meshes.length) throw new ModelError(409, `${a.name} has no parts yet: pick them on the model and press Weapon (W), or take it off`);
+      if (!a.placement) throw new ModelError(409, `Position ${a.name} on the unit first (Position on the page)`);
+      forBlender.push({ prefix, inFile: true, meshes, matrix: a.placement.matrix, handle: a.placement.handle });
+      for (const n of meshes) inFile[n] = `${prefix} ${n}`;
+    } else {
+      if (a.file?.status !== 'ready') throw new ModelError(409, `The accessory ${a.name} is not ready yet`);
+      if (!a.placement) throw new ModelError(409, `Position ${a.name} on the unit first (Position on the page)`);
+      const [m] = await prisma.$queryRawUnsafe(`SELECT blend, format, parts, assignments FROM "ModelFile" WHERE id = $1`, a.accessoryId);
+      const left = json(m.assignments) || {};
+      meshes = (json(m.parts) || []).filter(p => left[p.name] !== DROP && p.verts > 0).map(p => p.name);
+      if (!meshes.length) throw new ModelError(409, `The accessory ${a.name} has no meshes to add`);
+      forBlender.push({ prefix, data: Buffer.from(m.blend), format: m.format || 'blend', meshes, matrix: a.placement.matrix, handle: a.placement.handle });
+    }
     forStudio.push({ name: a.name, spot: a.spot, limb: a.limb, handle: `${prefix} Handle`, meshes: Object.fromEntries(meshes.map(n => [`${prefix} ${n}`, n])), doubleSided: a.doubleSided });
   }
-  return { forBlender, forStudio };
+  return { forBlender, forStudio, inFile };
 }
 
 // options: embedTextures (Path Mode Copy + Embed Textures) and smallScale (Scale 0.01), both yes unless told no.
@@ -477,7 +529,7 @@ async function buildExport(id, prisma, options = {}) {
   if (model.status !== 'ready') throw new ModelError(409, 'The model is not ready yet');
   if (model.format === 'fbx') throw new ModelError(400, 'This one is already an FBX. Attach it to a unit as an accessory instead.');
   const steps = plan(model.parts, model.assignments, model.labels);
-  const { forBlender, forStudio } = await accessoryExport(id, prisma);
+  const { forBlender, forStudio, inFile } = await accessoryExport(id, prisma);
   const rigs = rigPlan(model, steps);
   const settings = { embed: options.embedTextures !== false, scale: options.smallScale === false ? 1 : 0.01, fixFaces: options.invertFaces === true };
   let data, blenderPlan, rigged;
@@ -493,7 +545,7 @@ async function buildExport(id, prisma, options = {}) {
     blenderPlan = { ...steps, ...settings, accessories: forBlender, rigs };
     rigged = rigs.map(r => ({ mesh: r.mesh, bones: r.names }));
   }
-  return { model, steps, data, blenderPlan, forStudio, rigged };
+  return { model, steps, data, blenderPlan, forStudio, rigged, inFile };
 }
 
 // "Download rigged .blend": the unit as it goes to Studio (names, accessories, bones and weights) as a .blend.
@@ -504,13 +556,13 @@ async function rigBlend(id, prisma = getPrisma(), saveBlend = blender.saveBlend)
 }
 
 async function exportModel(id, by, prisma = getPrisma(), exportFbx = blender.exportFbx, options = {}) {
-  const { model, steps, data, blenderPlan, forStudio, rigged } = await buildExport(id, prisma, options);
+  const { model, steps, data, blenderPlan, forStudio, rigged, inFile } = await buildExport(id, prisma, options);
   const fbx = await exportFbx(data, blenderPlan);
   await prisma.$executeRawUnsafe(`UPDATE "ModelFile" SET "exportedAt" = now(), "exportedBy" = $2 WHERE id = $1`, id, by || null);
-  // The meshes to show both faces of, by the name they have in the FBX.
+  // The meshes to show both faces of, by the name they have in the FBX (a weapon part in the file: "A1 Blade").
   const dropped = new Set(steps.drop);
   const doubleSided = [
-    ...model.doubleSided.filter(n => !dropped.has(n)).map(n => steps.rename[n] || n),
+    ...model.doubleSided.filter(n => !dropped.has(n)).map(n => inFile[n] || steps.rename[n] || n),
     ...forStudio.filter(a => a.doubleSided).flatMap(a => Object.keys(a.meshes)),
   ];
   return { name: model.name.replace(/\.blend\d*$/i, '') + '.fbx', data: fbx, plan: steps, accessories: forStudio, doubleSided, rigged };
@@ -672,4 +724,4 @@ module.exports = { ensureSchema, create, list, get, file, setAssignments, export
   sendToStudio, studioQueued, claimStudio, studioFbx, reportStudio, STUDIO_STALE_MIN, STUDIO_TURNS,
   requestRbxm, saveRbxm, failRbxm, setRbxmPost, rbxmFile,
   addAccessory, updateAccessory, removeAccessory, rigBlend, uploadEdited, removeEdited, checkRigs, configHash,
-  plan, checkAssignments, ModelError, PRIMARY, SECONDARY, DROP, MESH_NAME, SPOTS };
+  plan, checkAssignments, ModelError, PRIMARY, SECONDARY, DROP, WEAPON, MESH_NAME, SPOTS };

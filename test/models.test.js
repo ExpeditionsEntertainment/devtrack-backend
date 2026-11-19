@@ -94,7 +94,7 @@ test('a weapon is uploaded, attached, positioned and goes into the FBX with what
   assert.equal((await store.get(sword, prisma)).kind, 'accessory');
   await assert.rejects(store.exportModel(sword, 'Alex', prisma, async () => Buffer.from('x')), /already an FBX/);
 
-  await assert.rejects(store.addAccessory(unit, { accessoryId: unit }, prisma), /its own accessory/);
+  await assert.rejects(store.addAccessory(sword, { accessoryId: sword }, prisma), /opened from a \.blend/);
   await assert.rejects(store.addAccessory(unit, { accessoryId: sword, spot: 'tail' }, prisma), /spot must be/);
   const acc = await store.addAccessory(unit, { accessoryId: sword }, prisma);
   assert.equal(acc.name, 'Cid Sword', 'named after the file');
@@ -134,6 +134,52 @@ test('a weapon is uploaded, attached, positioned and goes into the FBX with what
 
   await store.removeAccessory(unit, acc.id, prisma);
   assert.deepEqual((await store.get(unit, prisma)).accessories, []);
+});
+
+test('a weapon in the unit\'s own file: its parts are picked, it is positioned, and it goes into the FBX like any weapon', async () => {
+  const prisma = await createDb();
+  const parts = ['Body', 'Arm', 'Blade', 'Pole', 'Tassel', 'Empty'].map(name => ({ name, verts: name === 'Empty' ? 0 : 8 }));
+  const inspect = async () => ({ glb: Buffer.from('glTF'), parts, blender: '5.2.3' });
+  const { id: unit } = await store.create({ name: 'Whitebeard.blend', blend: BLEND }, prisma, inspect);
+  await until(async () => (await store.get(unit, prisma, inspect)).status === 'ready');
+
+  const glaive = await store.addAccessory(unit, { accessoryId: unit }, prisma);
+  assert.deepEqual([glaive.name, glaive.inFile, glaive.parts, glaive.spot, glaive.limb], ['Weapon', true, [], 'right-hand', 'Right Arm']);
+  const second = await store.addAccessory(unit, { accessoryId: unit }, prisma);
+  assert.equal(second.name, 'Weapon 2', 'a second one gets its own name');
+  assert.deepEqual((await store.get(unit, prisma)).attachedTo, [], 'a unit is not "on" itself');
+
+  // Its parts are picked like any category; a part on a weapon that doesn't exist (any more) is left unnamed.
+  const W = store.WEAPON + glaive.id;
+  await store.setAssignments(unit, { Body: 'Torso', Arm: 'Right Arm', Blade: W, Pole: W, Tassel: 'weapon:gone', Empty: W }, prisma, undefined, ['Blade', 'Body']);
+  let model = await store.get(unit, prisma);
+  assert.equal(model.assignments.Tassel, undefined);
+  assert.deepEqual(model.accessories.find(a => a.id === glaive.id).parts, ['Blade', 'Pole', 'Empty'], 'in the file\'s order');
+
+  await assert.rejects(store.exportModel(unit, 'Alex', prisma, async () => Buffer.from('x')), /Position Weapon on the unit first/);
+  const matrix = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0.3, 1, 0, 1];
+  await store.updateAccessory(unit, glaive.id, { name: 'Glaive', placement: { matrix, handle: [0.3, 1, 0] } }, prisma);
+  await assert.rejects(store.exportModel(unit, 'Alex', prisma, async () => Buffer.from('x')), /Weapon 2 has no parts yet/);
+  await store.removeAccessory(unit, second.id, prisma);
+
+  let given = null;
+  const out = await store.exportModel(unit, 'Alex', prisma, async (blend, plan) => { given = plan; return Buffer.from('FBX'); });
+  assert.deepEqual(given.rename, { Body: 'Torso', Arm: 'ArmRight' }, 'its parts are not body parts');
+  assert.deepEqual(given.drop, []);
+  assert.deepEqual(given.accessories, [{ prefix: 'A1', inFile: true, meshes: ['Blade', 'Pole'], matrix, handle: [0.3, 1, 0] }],
+    'no file to bring in, and an empty part stays out');
+  assert.deepEqual(out.accessories, [{ name: 'Glaive', spot: 'right-hand', limb: 'Right Arm', handle: 'A1 Handle', meshes: { 'A1 Blade': 'Blade', 'A1 Pole': 'Pole' }, doubleSided: false }],
+    'the Mac gets it like any weapon');
+  assert.deepEqual(out.doubleSided, ['A1 Blade', 'Torso'], 'a weapon part by its name in the FBX');
+  const hashBefore = (await store.get(unit, prisma)).configHash;
+  await store.setAssignments(unit, { Body: 'Torso', Arm: 'Right Arm', Blade: W }, prisma);
+  assert.notEqual((await store.get(unit, prisma)).configHash, hashBefore, 'a rigged .blend made before a part left the weapon is not used');
+
+  // Taken apart: its parts go back to not named.
+  await store.removeAccessory(unit, glaive.id, prisma);
+  model = await store.get(unit, prisma);
+  assert.deepEqual(model.assignments, { Body: 'Torso', Arm: 'Right Arm' });
+  assert.deepEqual(model.accessories, []);
 });
 
 test('bending parts: a cape gets bones, a rigged .blend can be downloaded, edited and used while it still matches', async () => {
