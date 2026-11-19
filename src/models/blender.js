@@ -6,23 +6,80 @@
 // after start-up) into BLENDER_DIR, by default the temp folder. That is about
 // 385 MB, once per deploy. railpack.json installs the system libraries it needs.
 //
+// Where from: download.blender.org first, then Blender's official mirrors (blender.org sits behind
+// Cloudflare, which turned Railway away with HTTP 403 on 2026-11-19). BLENDER_URL is tried before
+// all of them. Whatever comes down is checked against Blender's own SHA-256 before it's unpacked:
+// BLENDER_SHA256, the one known for this version, or the .sha256 list published with the release.
+//
 // .blend files can carry Python scripts; every run passes -Y so they never run.
 
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const crypto = require('crypto');
 const { execFile } = require('child_process');
 const { pipeline } = require('stream/promises');
-const { Readable } = require('stream');
+const { Readable, Transform } = require('stream');
 
 const VERSION = process.env.BLENDER_VERSION || '5.2.3';
 const SERIES = VERSION.split('.').slice(0, 2).join('.');
-const URL = `https://download.blender.org/release/Blender${SERIES}/blender-${VERSION}-linux-x64.tar.xz`;
+const FILE = `blender-${VERSION}-linux-x64.tar.xz`;
+const RELEASES = [
+  'https://download.blender.org/release',
+  'https://mirrors.ocf.berkeley.edu/blender/release',
+  'https://mirror.clarkson.edu/blender/release',
+  'https://ftp.nluug.nl/pub/graphics/blender/release',
+];
+// From https://download.blender.org/release/Blender5.2/blender-5.2.3.sha256
+const KNOWN_SHA256 = { '5.2.3': '78486c018b4443efe5e75ab54c290ed8c15abafd249b862c2c9ce2530a918eec' };
+const HEADERS = { 'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) blender-download' };
 const DIR = process.env.BLENDER_DIR || path.join(os.tmpdir(), 'devtrack-blender');
 const SCRIPTS = path.join(__dirname, 'blender');
 const RUN_MS = 5 * 60 * 1000;
 
 let installing = null;
+
+const sources = () => [process.env.BLENDER_URL, ...RELEASES.map(r => `${r}/Blender${SERIES}/${FILE}`)].filter(Boolean);
+const host = url => { try { return new URL(url).host; } catch { return url; } };
+
+// The SHA-256 the download must have.
+async function expectedSha256(get = fetch) {
+  if (process.env.BLENDER_SHA256) return process.env.BLENDER_SHA256.trim().toLowerCase();
+  if (KNOWN_SHA256[VERSION]) return KNOWN_SHA256[VERSION];
+  for (const r of RELEASES) {
+    try {
+      const res = await get(`${r}/Blender${SERIES}/blender-${VERSION}.sha256`, { headers: HEADERS, signal: AbortSignal.timeout(30 * 1000) });
+      if (!res.ok) continue;
+      const line = (await res.text()).split('\n').find(l => l.trim().endsWith(FILE));
+      if (line) return line.trim().split(/\s+/)[0].toLowerCase();
+    } catch { /* the next one */ }
+  }
+  return null;
+}
+
+// The archive, from the first place that hands over a file with the right checksum.
+async function fetchArchive(archive, get = fetch) {
+  const want = await expectedSha256(get);
+  if (!want) console.warn(`[Blender] No checksum found for ${FILE}; the download is not checked`);
+  const failed = [];
+  for (const url of sources()) {
+    try {
+      const res = await get(url, { headers: HEADERS, signal: AbortSignal.timeout(15 * 60 * 1000) });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const hash = crypto.createHash('sha256');
+      const tee = new Transform({ transform(chunk, enc, done) { hash.update(chunk); done(null, chunk); } });
+      await pipeline(Readable.fromWeb(res.body), tee, fs.createWriteStream(archive));
+      const got = hash.digest('hex');
+      if (want && got !== want) throw new Error(`the file's checksum is wrong (${got.slice(0, 12)}…)`);
+      return host(url);
+    } catch (err) {
+      failed.push(`${host(url)}: ${err.message}`);
+      console.error(`[Blender] ${host(url)}: ${err.message}`);
+      fs.rmSync(archive, { force: true });
+    }
+  }
+  throw new Error(`Could not download Blender ${VERSION} (${failed.join('; ')})`);
+}
 
 async function install() {
   const bin = path.join(DIR, `blender-${VERSION}-linux-x64`, 'blender');
@@ -32,9 +89,8 @@ async function install() {
   const archive = path.join(DIR, `blender-${VERSION}.tar.xz`);
   const started = Date.now();
   console.log(`[Blender] Downloading ${VERSION}…`);
-  const res = await fetch(URL);
-  if (!res.ok) throw new Error(`Could not download Blender ${VERSION}: HTTP ${res.status}`);
-  await pipeline(Readable.fromWeb(res.body), fs.createWriteStream(archive));
+  const from = await fetchArchive(archive);
+  console.log(`[Blender] Downloaded from ${from}`);
   await new Promise((resolve, reject) => execFile('tar', ['-xJf', archive, '-C', DIR], { timeout: 10 * 60 * 1000 },
     err => (err ? reject(new Error(`Could not unpack Blender: ${err.message}`)) : resolve())));
   fs.rmSync(archive, { force: true });
@@ -126,4 +182,4 @@ function prefetch() {
   setTimeout(() => blenderPath().catch(err => console.error('[Blender]', err.message)), 30 * 1000);
 }
 
-module.exports = { inspect, exportFbx, saveBlend, prefetch, VERSION };
+module.exports = { inspect, exportFbx, saveBlend, prefetch, VERSION, fetchArchive };
