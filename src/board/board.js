@@ -3,7 +3,8 @@
 // (everything that was on Linear came across once, see import-linear.js).
 //
 //   update     a game update ("Winter Update [6.0]") that cards are grouped under, to filter by
-//   card       a unit (Doumo, Rukia...) or anything else being made; kind 'unit' for the old ones
+//   card       a unit (Doumo, Rukia...), kind 'unit', on the Board tab; or anything else being made, kind
+//              'misc', on the Misc. tab, with what it is in "category" (Mount, Pet, Map...)
 //   task       a piece of work on a card (Animations, Mesh, Texture...), each with its own status
 //   subtask    a piece of a task, tracked on its own (Icons › Equipment, Texture › Shiny...)
 //   status     untasked, in_progress (with the dev doing it), blocked, done
@@ -90,6 +91,8 @@ async function ensureSchema(prisma = getPrisma()) {
     `CREATE INDEX IF NOT EXISTS "BoardBlock_task" ON "BoardBlock" ("taskId", "at")`,
   ];
   for (const sql of tables) await prisma.$executeRawUnsafe(sql);
+  // What a Misc. card is ("Mount", "Pet", "Map"...), added after the table was.
+  await prisma.$executeRawUnsafe(`ALTER TABLE "BoardCard" ADD COLUMN IF NOT EXISTS "category" TEXT`);
   ready.add(prisma);
 }
 
@@ -327,7 +330,7 @@ async function board(prisma = getPrisma(), now = new Date()) {
     return {
       id: c.id, identifier: c.identifier, name: c.name, kind: c.kind,
       update: c.updateId && updateName.has(c.updateId) ? { id: c.updateId, name: updateName.get(c.updateId) } : null,
-      rarity: c.rarity || null, element: c.element || null, notionUrl: c.notionUrl || null, createdAt: c.createdAt,
+      rarity: c.rarity || null, element: c.element || null, category: c.category || null, notionUrl: c.notionUrl || null, createdAt: c.createdAt,
       baseImage: cardImages.filter(im => im.kind === 'base').at(-1) || null,
       images: cardImages.filter(im => im.kind === 'ref'), notes: notes.get(c.id)?.text || '',
       tasks,
@@ -551,14 +554,19 @@ async function checkUpdate(prisma, updateId) {
 }
 
 // tasks: [{ name, subtasks: [names] }]; left out, a unit gets UNIT_TEMPLATE and anything else starts empty.
+// A card is a unit (the Board tab) or misc (the Misc. tab: mounts, pets, maps, anything else).
+// "other" is what the page called misc before it had its own tab.
+const kindOf = v => (v == null || v === 'unit' ? 'unit' : 'misc');
+
 async function createCard(body = {}, by, prisma = getPrisma()) {
   await ensureSchema(prisma);
-  const kind = body.kind === 'other' ? 'other' : 'unit';
+  const kind = kindOf(body.kind);
   const tasks = Array.isArray(body.tasks) ? body.tasks : kind === 'unit' ? UNIT_TEMPLATE : [];
   if (tasks.length > 40) throw new BoardError(400, 'That is too many tasks for one card');
   const id = newId();
-  await prisma.$executeRawUnsafe(`INSERT INTO "BoardCard" (id, identifier, name, kind, "updateId", rarity, "notionUrl", "createdBy") VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-    id, await nextIdentifier(prisma), cleanName(body.name, 'A card name'), kind, await checkUpdate(prisma, body.updateId), RARITY(body.rarity), URLISH(body.notionUrl), by || null);
+  await prisma.$executeRawUnsafe(`INSERT INTO "BoardCard" (id, identifier, name, kind, "updateId", rarity, "notionUrl", "createdBy", category) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+    id, await nextIdentifier(prisma), cleanName(body.name, 'A card name'), kind, await checkUpdate(prisma, body.updateId), RARITY(body.rarity), URLISH(body.notionUrl), by || null,
+    RARITY(body.category));
   for (const t of tasks) {
     const task = await addTask(id, { name: typeof t === 'string' ? t : t.name }, by, prisma);
     for (const s of (Array.isArray(t.subtasks) ? t.subtasks : []).slice(0, 20)) await addTask(id, { name: s, parentId: task.id }, by, prisma);
@@ -573,6 +581,8 @@ async function updateCard(ref, body = {}, prisma = getPrisma()) {
   if ('updateId' in body) sets.updateId = await checkUpdate(prisma, body.updateId);
   if ('rarity' in body) sets.rarity = RARITY(body.rarity);
   if ('element' in body) sets.element = RARITY(body.element);
+  if ('category' in body) sets.category = RARITY(body.category);
+  if ('kind' in body) sets.kind = kindOf(body.kind); // moved between the Board and Misc. tabs
   if ('notionUrl' in body) sets.notionUrl = URLISH(body.notionUrl);
   const keys = Object.keys(sets);
   if (keys.length) {
