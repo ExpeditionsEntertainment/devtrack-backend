@@ -4,6 +4,7 @@
 #              "embed": true, "scale": 0.01, "accessories": [...] }
 # embed  Path Mode Copy with Embed Textures ticked (false: Path Mode Auto, not embedded)
 # scale  the export dialog's Scale (0.01 or 1.0)
+# splits  parts to cut into their loose pieces first (common.split_parts), as the page shows them
 # accessories  see accessories.py
 # rigs  bone chains for bending parts, see rig.py
 # saveBlend, configHash  save a .blend instead of exporting ("Download rigged .blend"), marked with what it was made from
@@ -23,6 +24,10 @@ embed = bool(plan.get('embed', True))
 scale = float(plan.get('scale', 0.01))
 
 show_everything()
+# Parts cut into their loose pieces on the page, the same way inspect.py did, so the names match.
+if plan.get('splits'):
+    from common import split_parts
+    split_parts(plan['splits'])
 by_name = {o.name: o for o in parts()}
 
 # The parts of a weapon in the unit's own file are set aside first, so naming the body can't touch

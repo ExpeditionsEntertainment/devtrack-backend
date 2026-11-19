@@ -32,6 +32,14 @@
 // ("edited"), it's used for the FBX instead, as long as the names and rig it was made from are
 // still the page's (configHash).
 //
+// Split: a part that holds both sides (both arms in one mesh, a mirror never applied; inspect.py says so
+// with "sides") can be cut into its two sides ("splits": the parts to cut, in order). Its loose pieces go
+// to the side of the part's middle they're on, so a bracelet stays with its arm. The .blend stays as it
+// was; Blender cuts them each time it opens the file or exports it (common.py split_parts), naming the
+// sides "<part> 1" (the -X side) and "<part> 2", each with its origin in its own middle. Each side keeps
+// the part's category unless that was a body part (there's only one Left Arm); joining back puts the
+// part back, not named.
+//
 // Double sided: any part, and any accessory as a whole, can be marked to show
 // both faces in Studio (MeshPart.DoubleSided, which only Studio and plugins can
 // set). The Studio job carries the FBX names of those meshes; the Mac sets it.
@@ -102,6 +110,7 @@ async function ensureSchema(prisma = getPrisma()) {
   for (const col of ['"rigs" JSONB NOT NULL DEFAULT \'{}\'::jsonb', '"editedBlend" BYTEA', '"editedGlb" BYTEA', '"editedInfo" JSONB',
     '"editedStatus" TEXT', '"editedError" TEXT', '"editedAt" TIMESTAMP', '"editedBy" TEXT',
     '"labels" JSONB NOT NULL DEFAULT \'{}\'::jsonb', '"doubleSided" JSONB NOT NULL DEFAULT \'[]\'::jsonb', '"kind" TEXT NOT NULL DEFAULT \'unit\'', '"format" TEXT NOT NULL DEFAULT \'blend\'',
+    '"splits" JSONB NOT NULL DEFAULT \'[]\'::jsonb',
     '"studioStatus" TEXT', '"studioFbx" BYTEA', '"studioFbxName" TEXT', '"studioOptions" JSONB', '"studioAssetId" TEXT',
     '"studioError" TEXT', '"studioResult" JSONB', '"studioBy" TEXT', '"studioQueuedAt" TIMESTAMP', '"studioAt" TIMESTAMP',
     '"rbxmStatus" TEXT', '"rbxm" BYTEA', '"rbxmUnit" TEXT', '"rbxmSize" INTEGER', '"rbxmError" TEXT', '"rbxmPost" JSONB', '"rbxmBy" TEXT',
@@ -117,7 +126,7 @@ const STUDIO_ACTIVE = ['queued', 'uploading', 'importing'];
 const STUDIO_REPORTS = ['uploading', 'importing', 'done', 'failed'];
 const STUDIO_STALE_MIN = 15; // a job the Mac took and then went quiet on for this long has failed
 const RBXM_ACTIVE = ['queued', 'saving'];
-const SUMMARY_COLUMNS = `id, name, kind, format, labels, "doubleSided", "uploadedBy", "sourceUrl", status, error, blender, parts, assignments, "exportedAt", "exportedBy",
+const SUMMARY_COLUMNS = `id, name, kind, format, labels, "doubleSided", splits, "uploadedBy", "sourceUrl", status, error, blender, parts, assignments, "exportedAt", "exportedBy",
   "createdAt", "updatedAt", "studioStatus", "studioAssetId", "studioError", "studioResult", "studioOptions", "studioBy", "studioQueuedAt", "studioAt",
   "rbxmStatus", "rbxmUnit", "rbxmSize", "rbxmError", "rbxmPost", "rbxmBy", "rbxmAt",
   rigs, "editedInfo", "editedStatus", "editedError", "editedAt", "editedBy"`;
@@ -230,18 +239,32 @@ function startConvert(id, prisma = getPrisma(), inspect = blender.inspect) {
   converting.add(id);
   (async () => {
     try {
-      const [row] = await prisma.$queryRawUnsafe(`SELECT "blend", format FROM "ModelFile" WHERE id = $1`, id);
+      const [row] = await prisma.$queryRawUnsafe(`SELECT "blend", format, parts, assignments, labels, "doubleSided", rigs, splits FROM "ModelFile" WHERE id = $1`, id);
       if (!row) return;
-      const { glb, parts, blender: version } = await inspect(Buffer.from(row.blend), row.format || 'blend');
-      const assignments = {};
-      // Parts already named right: "Head", "Right Arm", or the house style "ArmRight".
-      for (const p of parts) {
-        const cat = PRIMARY.includes(p.name) ? p.name : FROM_MESH_NAME[p.name.toLowerCase()];
-        if (cat && !Object.values(assignments).includes(cat)) assignments[p.name] = cat;
+      const splits = json(row.splits) || [];
+      const got = await inspect(Buffer.from(row.blend), row.format || 'blend', splits);
+      const { glb, parts, blender: version } = got;
+      let names;
+      if (json(row.parts)) {
+        // Opened again because a part was split or joined back: what was named stays named.
+        names = carryOver({ assignments: json(row.assignments) || {}, labels: json(row.labels) || {}, doubleSided: json(row.doubleSided) || [], rigs: json(row.rigs) || {} },
+          parts.map(p => p.name), got.splits || {});
+      } else {
+        const assignments = {};
+        // Parts already named right: "Head", "Right Arm", or the house style "ArmRight".
+        for (const p of parts) {
+          const cat = PRIMARY.includes(p.name) ? p.name : FROM_MESH_NAME[p.name.toLowerCase()];
+          if (cat && !Object.values(assignments).includes(cat)) assignments[p.name] = cat;
+        }
+        names = { assignments, labels: json(row.labels) || {}, doubleSided: json(row.doubleSided) || [], rigs: json(row.rigs) || {} };
       }
+      // A part that turned out to be one piece isn't split after all.
+      const cut = splits.filter(s => (got.splits?.[s] || []).length > 1);
       await prisma.$executeRawUnsafe(`UPDATE "ModelFile" SET status = 'ready', error = NULL, glb = $2, parts = $3::jsonb, blender = $4,
-        assignments = $5::jsonb, "updatedAt" = now() WHERE id = $1`, id, glb, JSON.stringify(parts), version, JSON.stringify(assignments));
-      console.log(`[Models] ${id}: ${parts.length} parts`);
+        assignments = $5::jsonb, labels = $6::jsonb, "doubleSided" = $7::jsonb, rigs = $8::jsonb, splits = $9::jsonb, "updatedAt" = now() WHERE id = $1`,
+      id, glb, JSON.stringify(parts), version, JSON.stringify(names.assignments), JSON.stringify(names.labels), JSON.stringify(names.doubleSided),
+      JSON.stringify(names.rigs), JSON.stringify(cut));
+      console.log(`[Models] ${id}: ${parts.length} parts${cut.length ? ` (${cut.length} split)` : ''}`);
     } catch (err) {
       console.error(`[Models] ${id} failed:`, err.message);
       await prisma.$executeRawUnsafe(`UPDATE "ModelFile" SET status = 'failed', error = $2, "updatedAt" = now() WHERE id = $1`, id, err.message.slice(0, 2000)).catch(() => {});
@@ -249,6 +272,54 @@ function startConvert(id, prisma = getPrisma(), inspect = blender.inspect) {
       converting.delete(id);
     }
   })();
+}
+
+// After a split or join: names, words and double sided kept for the parts that are still there; a part
+// just cut into pieces hands its category, word and double sided to each piece, unless it was a body part
+// (Head, Torso, an arm or leg: there's only one of each). Bones go with the part they were on.
+function carryOver(before, names, made) {
+  const has = new Set(names);
+  const keep = obj => Object.fromEntries(Object.entries(obj).filter(([k]) => has.has(k)));
+  const out = { assignments: keep(before.assignments), labels: keep(before.labels), rigs: keep(before.rigs) };
+  const both = new Set(before.doubleSided.filter(n => has.has(n)));
+  for (const [whole, pieces] of Object.entries(made)) {
+    if (pieces.length < 2 || has.has(whole)) continue;
+    const cat = before.assignments[whole];
+    for (const p of pieces.filter(n => has.has(n))) {
+      if (cat && !PRIMARY.includes(cat) && !(p in out.assignments)) out.assignments[p] = cat;
+      if (before.labels[whole] && !(p in out.labels)) out.labels[p] = before.labels[whole];
+      if (before.doubleSided.includes(whole)) both.add(p);
+    }
+  }
+  out.doubleSided = [...both];
+  return out;
+}
+
+// Cut a part into its two sides, or put a split part back together; the model is opened again either way.
+async function split(id, part, prisma = getPrisma(), inspect) {
+  const model = await get(id, prisma);
+  if (model.status !== 'ready') throw new ModelError(409, 'The model is not ready yet');
+  if (model.format !== 'blend') throw new ModelError(400, 'Only a model opened from a .blend can be split');
+  const p = model.parts.find(x => x.name === part);
+  if (!p) throw new ModelError(400, `No part called "${part}"`);
+  if (p.sides === false) throw new ModelError(400, `${part} has no separate left and right to split`);
+  return reopen(id, [...model.splits, part], prisma, inspect);
+}
+
+async function joinBack(id, part, prisma = getPrisma(), inspect) {
+  const model = await get(id, prisma);
+  if (model.status !== 'ready') throw new ModelError(409, 'The model is not ready yet');
+  if (!model.splits.includes(part)) throw new ModelError(400, `${part} was not split`);
+  // Any of its pieces split again go back too.
+  return reopen(id, model.splits.filter(s => s !== part && !s.startsWith(`${part} `)), prisma, inspect);
+}
+
+async function reopen(id, splits, prisma, inspect) {
+  const done = await prisma.$executeRawUnsafe(`UPDATE "ModelFile" SET splits = $2::jsonb, status = 'converting', error = NULL, "updatedAt" = now()
+    WHERE id = $1 AND status = 'ready'`, id, JSON.stringify(splits));
+  if (!done) throw new ModelError(409, 'The model is being opened already');
+  startConvert(id, prisma, inspect);
+  return { status: 'converting', splits };
 }
 
 // kind: 'unit' (from Discord) or 'accessory' (added on a unit's page). An accessory can also be an FBX.
@@ -284,7 +355,7 @@ async function get(id, prisma = getPrisma(), inspect) {
   if (row.editedStatus === 'converting') startEditedConvert(id, prisma, inspect);
   const model = {
     ...summary(row), parts: json(row.parts) || [], assignments: json(row.assignments) || {}, labels: json(row.labels) || {},
-    doubleSided: json(row.doubleSided) || [], rigs: json(row.rigs) || {},
+    doubleSided: json(row.doubleSided) || [], rigs: json(row.rigs) || {}, splits: json(row.splits) || [],
     categories: { primary: PRIMARY, secondary: SECONDARY, meshNames: MESH_NAME, spots: SPOTS },
     accessories: await accessoriesOf(id, prisma), attachedTo: await attachedTo(id, prisma),
   };
@@ -390,7 +461,7 @@ function rigPlan(model, steps) {
 // used while this is still the same, so a file made before a change can't quietly undo it.
 function configHash(model, accs) {
   const steps = plan(model.parts, model.assignments, model.labels);
-  const cfg = { rename: steps.rename, drop: steps.drop, rigs: rigPlan(model, steps), acc: (accs || []).map(a => [a.accessoryId, a.name, a.spot, a.placement, ...(a.inFile ? [a.parts] : [])]) };
+  const cfg = { splits: model.splits || [], rename: steps.rename, drop: steps.drop, rigs: rigPlan(model, steps), acc: (accs || []).map(a => [a.accessoryId, a.name, a.spot, a.placement, ...(a.inFile ? [a.parts] : [])]) };
   return require('crypto').createHash('sha1').update(JSON.stringify(cfg)).digest('hex').slice(0, 12);
 }
 
@@ -538,11 +609,11 @@ async function buildExport(id, prisma, options = {}) {
       throw new ModelError(409, 'Names, bending parts or accessories changed since the rigged .blend was downloaded. Download it again and redo the edits, or remove the edited .blend to use the automatic rig.');
     }
     data = (await file(id, 'editedBlend', prisma)).data;
-    blenderPlan = { rename: {}, drop: [], ...settings, accessories: [], rigs: [] };
+    blenderPlan = { splits: [], rename: {}, drop: [], ...settings, accessories: [], rigs: [] }; // its parts are split already
     rigged = (model.edited.info?.skinned || []).map(mesh => ({ mesh }));
   } else {
     data = (await file(id, 'blend', prisma)).data;
-    blenderPlan = { ...steps, ...settings, accessories: forBlender, rigs };
+    blenderPlan = { splits: model.splits, ...steps, ...settings, accessories: forBlender, rigs };
     rigged = rigs.map(r => ({ mesh: r.mesh, bones: r.names }));
   }
   return { model, steps, data, blenderPlan, forStudio, rigged, inFile };
@@ -723,5 +794,5 @@ async function remove(id, prisma = getPrisma()) {
 module.exports = { ensureSchema, create, list, get, file, setAssignments, exportModel, remove,
   sendToStudio, studioQueued, claimStudio, studioFbx, reportStudio, STUDIO_STALE_MIN, STUDIO_TURNS,
   requestRbxm, saveRbxm, failRbxm, setRbxmPost, rbxmFile,
-  addAccessory, updateAccessory, removeAccessory, rigBlend, uploadEdited, removeEdited, checkRigs, configHash,
+  addAccessory, updateAccessory, removeAccessory, rigBlend, uploadEdited, removeEdited, checkRigs, configHash, split, joinBack,
   plan, checkAssignments, ModelError, PRIMARY, SECONDARY, DROP, WEAPON, MESH_NAME, SPOTS };

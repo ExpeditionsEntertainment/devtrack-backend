@@ -75,6 +75,10 @@ function pageRouter() {
     }));
   }
   router.put('/:id/assignments', wrap(async (req, res) => res.json({ assignments: await store.setAssignments(req.params.id, req.body?.assignments, undefined, req.body?.labels, req.body?.doubleSided, req.body?.rigs) })));
+  // A part that holds both sides (both arms in one mesh): cut it into its left and right, or put it back together.
+  // The model is opened in Blender again; the page waits for it like a new one.
+  router.post('/:id/split', wrap(async (req, res) => res.status(202).json(await store.split(req.params.id, String(req.body?.part || '')))));
+  router.post('/:id/join', wrap(async (req, res) => res.status(202).json(await store.joinBack(req.params.id, String(req.body?.part || '')))));
   // Weapons and other accessories: upload one from the page (.blend or .fbx), attach it, position it.
   router.post('/upload', express.raw({ type: () => true, limit: '40mb' }), wrap(async (req, res) => {
     res.status(201).json(await store.create({ name: header(req, 'x-file-name'), blend: req.body, uploadedBy: req.user?.name || req.user?.email, kind: 'accessory' }));

@@ -60,6 +60,8 @@ test('a .blend is stored, converted, named and planned for export', async () => 
   const inverted = await store.exportModel(id, 'Alex', prisma, async (blend, plan) => plan, { invertFaces: true });
   assert.equal(inverted.data.fixFaces, true);
   delete given.plan.embed; delete given.plan.scale; delete given.plan.fixFaces; delete given.plan.rigs;
+  assert.deepEqual(given.plan.splits, []);
+  delete given.plan.splits;
   assert.deepEqual(given.plan.accessories, []);
   delete given.plan.accessories;
   // The house style of a finished unit: ArmRight, "Head Hair", numbered when there's no word, " 2" on a repeat.
@@ -248,6 +250,72 @@ test('bending parts: a cape gets bones, a rigged .blend can be downloaded, edite
   assert.equal((await store.get(id, prisma)).edited, null);
   const back = await store.exportModel(id, 'Alex', prisma, async (blend, p) => p);
   assert.equal(back.data.rigs.length, 1, 'back to the automatic rig');
+});
+
+test('a part holding both sides (both arms in one mesh) is split into its left and right, keeps what it was named, and can be joined back', async () => {
+  const prisma = await createDb();
+  // Blender, as a stand-in: Arms and Pads have a left and a right; a split part comes back as "<part> 1", "<part> 2".
+  const seen = [];
+  const inspect = async (blend, format, splits = []) => {
+    seen.push(splits);
+    await new Promise(r => setTimeout(r, 150)); // Blender takes a moment
+    let parts = [{ name: 'Body', verts: 8, sides: false }, { name: 'Arms', verts: 16, sides: true }, { name: 'Pads', verts: 16, sides: true }, { name: 'Mystery', verts: 8 }];
+    const made = {};
+    for (const s of splits) {
+      const p = parts.find(x => x.name === s);
+      if (!p) continue;
+      if (!p.sides) { made[s] = [s]; continue; }
+      const pieces = [1, 2].map(i => ({ name: `${s} ${i}`, verts: 8, sides: false, from: s }));
+      parts = parts.flatMap(x => (x === p ? pieces : [x]));
+      made[s] = pieces.map(x => x.name);
+    }
+    return { glb: Buffer.from('glTF'), parts, blender: '5.2.3', splits: made };
+  };
+  const { id } = await store.create({ name: 'Whitebeard.blend', blend: BLEND }, prisma, inspect);
+  const ready = async () => until(async () => (await store.get(id, prisma, inspect)).status === 'ready');
+  await ready();
+  await store.setAssignments(id, { Body: 'Torso', Arms: 'Left Arm', Pads: 'Torso Accessory' }, prisma, { Pads: 'Pad' }, ['Pads', 'Body']);
+
+  await assert.rejects(store.split(id, 'Body', prisma, inspect), /no separate left and right/);
+  await assert.rejects(store.split(id, 'Nope', prisma, inspect), /No part/);
+  assert.equal((await store.split(id, 'Arms', prisma, inspect)).status, 'converting');
+  await assert.rejects(store.split(id, 'Pads', prisma, inspect), /not ready yet/, 'one at a time');
+  await ready();
+  let m = await store.get(id, prisma);
+  assert.deepEqual(m.parts.map(p => p.name), ['Body', 'Arms 1', 'Arms 2', 'Pads', 'Mystery']);
+  assert.equal(m.parts.find(p => p.name === 'Arms 2').from, 'Arms');
+  assert.deepEqual(m.assignments, { Body: 'Torso', Pads: 'Torso Accessory' }, 'a body part does not pass to both sides (there is one Left Arm)');
+  assert.deepEqual(m.splits, ['Arms']);
+
+  await store.split(id, 'Pads', prisma, inspect);
+  await ready();
+  m = await store.get(id, prisma);
+  assert.deepEqual(seen.at(-1), ['Arms', 'Pads'], 'Blender cuts every split part, in order, each time');
+  assert.deepEqual([m.assignments['Pads 1'], m.assignments['Pads 2']], ['Torso Accessory', 'Torso Accessory'], 'an accessory passes to each side');
+  assert.deepEqual([m.labels['Pads 1'], m.labels['Pads 2']], ['Pad', 'Pad']);
+  assert.deepEqual(m.doubleSided.sort(), ['Body', 'Pads 1', 'Pads 2']);
+
+  // The pieces are what's exported: the same splits go to Blender, then the names.
+  await store.setAssignments(id, { ...m.assignments, 'Arms 1': 'Right Arm', 'Arms 2': 'Left Arm' }, prisma);
+  let given = null;
+  await store.exportModel(id, 'Alex', prisma, async (blend, plan) => { given = plan; return Buffer.from('FBX'); });
+  assert.deepEqual(given.splits, ['Arms', 'Pads']);
+  assert.deepEqual(given.rename, { Body: 'Torso', 'Arms 1': 'ArmRight', 'Arms 2': 'ArmLeft', 'Pads 1': 'Torso Pad', 'Pads 2': 'Torso Pad 2' });
+
+  // Joined back: the part returns, not named; its sides' names go.
+  await assert.rejects(store.joinBack(id, 'Body', prisma, inspect), /was not split/);
+  await store.joinBack(id, 'Arms', prisma, inspect);
+  await ready();
+  m = await store.get(id, prisma);
+  assert.deepEqual(m.splits, ['Pads']);
+  assert.ok(m.parts.some(p => p.name === 'Arms') && !m.parts.some(p => p.name.startsWith('Arms ')));
+  assert.equal(m.assignments.Arms, undefined);
+  assert.equal(m.assignments['Pads 1'], 'Torso Accessory', 'the other split stays as it was');
+
+  // A part Blender finds has nothing on one side after all (older models don't say) isn't kept as split.
+  await store.split(id, 'Mystery', prisma, inspect);
+  await ready();
+  assert.deepEqual((await store.get(id, prisma)).splits, ['Pads']);
 });
 
 test('a conversion that fails says why', async () => {
