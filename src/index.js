@@ -33,7 +33,7 @@ const authMiddleware = require('./middleware/auth');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
-const allowedOrigins = (process.env.CORS_ORIGIN || 'https://lambent-lily-7bf643.netlify.app')
+const allowedOrigins = (process.env.CORS_ORIGIN || 'https://aedevtrack.netlify.app')
   .split(',')
   .map(origin => origin.trim())
   .filter(Boolean);

@@ -1,6 +1,6 @@
 const { alert } = require('./discord-notifier');
 
-const DASHBOARD_URL = process.env.DASHBOARD_URL || 'https://lambent-lily-7bf643.netlify.app';
+const DASHBOARD_URL = process.env.DASHBOARD_URL || 'https://aedevtrack.netlify.app';
 
 function ageFromDate(date) {
   if (!date) return null;

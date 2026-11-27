@@ -136,7 +136,7 @@ async function settingsView() {
 }
 
 // Discord can't ask what unblocked a task, so a blocked one is moved on from the board.
-const DASHBOARD = () => (process.env.DASHBOARD_URL || 'https://lambent-lily-7bf643.netlify.app').replace(/\/+$/, '');
+const DASHBOARD = () => (process.env.DASHBOARD_URL || 'https://aedevtrack.netlify.app').replace(/\/+$/, '');
 function notBlocked(t) {
   if (t.status !== 'blocked') return;
   throw new B.BoardError(409, `${t.identifier} is blocked. Unblock it on the Assets board, where it asks what fixed it: ${DASHBOARD()}/assets/?item=${encodeURIComponent(t.identifier)}`);
