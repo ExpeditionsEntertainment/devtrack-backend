@@ -25,7 +25,7 @@ const B = require('./board');
 const MODEL = () => process.env.BOARD_MODEL || 'claude-opus-5-5';
 const ACTIONS = ['mark_done', 'mark_in_progress', 'mark_untasked', 'mark_blocked', 'add_note', 'needs_reply', 'progress_update'];
 const MAX_BATCH = 250;
-const DASHBOARD = () => (process.env.DASHBOARD_URL || 'https://lambent-lily-7bf643.netlify.app').replace(/\/+$/, '');
+const DASHBOARD = () => (process.env.DASHBOARD_URL || 'https://aedevtrack.netlify.app').replace(/\/+$/, '');
 
 const json = v => (typeof v === 'string' ? JSON.parse(v) : v);
 
