@@ -126,3 +126,6 @@ require('./models/blender').prefetch();
 // gone through every few hours, a daily check-in DM.
 require('./board/board').start();
 require('./board/triage').start();
+
+// Once a day: images from Discord, Studio FBXs and posted .rbxm files that aren't needed any more.
+require('./storage').start();

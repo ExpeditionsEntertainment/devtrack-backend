@@ -106,6 +106,14 @@ function pageRouter() {
   }));
   router.delete('/images/:id', wrap(async (req, res) => { await B.removeImage(req.params.id); res.json({ ok: true }); }));
 
+  // What's using the database's room, and clearing out what isn't needed (see storage.js).
+  router.get('/storage', wrap(async (req, res) => res.json(await require('../storage').report())));
+  router.post('/storage/cleanup', wrap(async (req, res) => {
+    const storage = require('../storage');
+    const done = await storage.cleanup(undefined, new Date(), who(req));
+    res.json({ done, ...(await storage.report()) });
+  }));
+
   router.get('/settings', wrap(async (req, res) => res.json(await settingsView())));
   router.put('/settings', wrap(async (req, res) => { await B.setSettings(req.body || {}); res.json(await settingsView()); }));
 
