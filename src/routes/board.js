@@ -8,7 +8,7 @@
 const express = require('express');
 const axios = require('axios');
 const auth = require('../middleware/auth');
-const { requireRole } = require('../middleware/roles');
+const { requirePageAccess } = require('../middleware/page-access');
 const B = require('../board/board');
 const T = require('../board/triage');
 const devs = require('../devs');
@@ -36,7 +36,8 @@ function pageRouter() {
     res.set('Cache-Control', 'private, max-age=31536000, immutable');
     res.send(data);
   }));
-  router.use(auth, requireRole('admin'));
+  // Admins, and anyone with the Assets box ticked on their account (Admin > Page Access).
+  router.use(auth, requirePageAccess('assets'));
 
   router.get('/', wrap(async (req, res) => res.json(await B.board())));
 

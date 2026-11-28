@@ -68,7 +68,7 @@ async function ensureUserAccessColumn() {
 }
 
 function defaultPageAccess(role) {
-  if (['owner', 'admin'].includes(role)) return ['bugs', 'suggestions', 'imports', 'expenses', 'admin', 'tasks', 'reports'];
+  if (['owner', 'admin'].includes(role)) return ['bugs', 'suggestions', 'imports', 'expenses', 'admin', 'tasks', 'reports', 'assets'];
   if (role === 'engineer') return ['bugs', 'suggestions', 'imports', 'tasks', 'reports'];
   return ['bugs'];
 }
