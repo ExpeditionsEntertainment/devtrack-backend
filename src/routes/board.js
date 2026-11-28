@@ -52,15 +52,17 @@ function pageRouter() {
   router.delete('/cards/:ref', wrap(async (req, res) => { await B.archiveCard(req.params.ref); nudgeDots(); res.json({ ok: true }); }));
   router.post('/cards/:ref/tasks', wrap(async (req, res) => res.status(201).json(await B.addTask(req.params.ref, { name: req.body?.name, parentId: req.body?.parentId }, who(req)))));
 
-  // Tasks and subtasks: a status (with the dev; blocking takes a reason, and unblocking a resolution), or a new name
+  // Tasks and subtasks: a status (with the dev; blocking takes a reason, and unblocking a resolution), a new name,
+  // or a new place (parentId: the task to go under, or null for its own task on the card)
   router.patch('/items/:ref', wrap(async (req, res) => {
     let t = null;
+    if ('parentId' in (req.body || {})) t = await B.moveTask(req.params.ref, req.body.parentId, who(req));
     if ('name' in (req.body || {})) t = await B.renameTask(req.params.ref, req.body.name, who(req));
     if ('status' in (req.body || {})) {
       t = await B.setStatus(req.params.ref, req.body.status, req.body.devId, who(req), undefined, { reason: req.body.reason, resolution: req.body.resolution });
       nudgeDots();
     }
-    if (!t) throw new B.BoardError(400, 'Send a status or a name');
+    if (!t) throw new B.BoardError(400, 'Send a status, a name or a parentId');
     res.json({ ok: true, identifier: t.identifier, name: t.name, status: t.status });
   }));
   router.delete('/items/:ref', wrap(async (req, res) => { const r = await B.removeTask(req.params.ref); nudgeDots(); res.json(r); }));
