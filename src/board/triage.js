@@ -77,7 +77,7 @@ async function addMessage(m, prisma = getPrisma(), download = fetch) {
 // ── going through them ──
 
 const SYSTEM = `You help Alex, who runs asset production for a Roblox game, keep the asset board up to date.
-The board lists cards (mostly units: characters) and their tasks (Animations, Mesh, Texture, Aura, Icons, VFX, Cosmetic...), some with subtasks of their own (Icons › Equipment, Texture › Shiny...), each Untasked, In progress (with the developer doing it), Blocked (with what is blocking it) or Done.
+The board lists cards (mostly units: characters) and their tasks (Animations, Mesh, Shiny Mesh, Aura, Icons, VFX, Cosmetic...), some with subtasks of their own (Mesh › Texture, Shiny Mesh › Shiny Texture, Icons › Equipment...), each Untasked, In progress (with the developer doing it), Blocked (with what is blocking it) or Done.
 You get the board as it stands and the developers' recent Discord messages. Suggest the changes the messages clearly support, for Alex to approve:
 - mark_done: the developer says a task is finished or posts its final files.
 - mark_in_progress: a developer says they have started a task that is Untasked (dev: their name exactly as on the roster).
