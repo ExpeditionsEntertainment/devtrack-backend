@@ -122,7 +122,9 @@ test('new cards start from the unit template; tasks and subtasks can be added, r
   assert.match(card.identifier, /^ASS-\d+$/);
   let b = await B.board(prisma, NOW);
   let doumo = b.cards.find(c => c.id === card.id);
-  assert.deepEqual(doumo.tasks.map(t => t.name), ['Animations', 'Mesh', 'Texture', 'Aura', 'Icons', 'VFX', 'Cosmetic']);
+  assert.deepEqual(doumo.tasks.map(t => t.name), ['Animations', 'Mesh', 'Shiny Mesh', 'Aura', 'Icons', 'VFX', 'Cosmetic']);
+  assert.deepEqual(doumo.tasks.find(t => t.name === 'Mesh').subtasks.map(s => s.name), ['Texture']);
+  assert.deepEqual(doumo.tasks.find(t => t.name === 'Shiny Mesh').subtasks.map(s => s.name), ['Shiny Texture']);
   assert.deepEqual(doumo.tasks.find(t => t.name === 'Icons').subtasks.map(s => s.name), ['Equipment', 'Evo Item']);
   assert.equal(doumo.update.name, 'Update 7');
   assert.equal(b.updates.find(u => u.id === upd.id).cards, 1);

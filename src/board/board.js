@@ -6,7 +6,7 @@
 //   card       a unit (Doumo, Rukia...), kind 'unit', on the Board tab; or anything else being made, kind
 //              'misc', on the Misc. tab, with what it is in "category" (Mount, Pet, Map...)
 //   task       a piece of work on a card (Animations, Mesh, Texture...), each with its own status
-//   subtask    a piece of a task, tracked on its own (Icons › Equipment, Texture › Shiny...)
+//   subtask    a piece of a task, tracked on its own (Mesh › Texture, Shiny Mesh › Shiny Texture, Icons › Equipment...)
 //   status     untasked, in_progress (with the dev doing it), blocked, done
 //   block      why a task is blocked, and what unblocked it: a reason is needed to block one,
 //              and a resolution to move it on again (BoardBlock keeps every block, for the history)
@@ -37,7 +37,7 @@ const PREFIX = 'ASS';
 
 // A new unit starts with these, in this order; the order is also how every card's tasks are sorted.
 const UNIT_TEMPLATE = [
-  { name: 'Animations' }, { name: 'Mesh' }, { name: 'Texture' }, { name: 'Aura' },
+  { name: 'Animations' }, { name: 'Mesh', subtasks: ['Texture'] }, { name: 'Shiny Mesh', subtasks: ['Shiny Texture'] }, { name: 'Aura' },
   { name: 'Icons', subtasks: ['Equipment', 'Evo Item'] }, { name: 'VFX' }, { name: 'Cosmetic' },
 ];
 const ORDER = [/anim/, /mesh|model/, /texture/, /aura/, /icon/, /vfx|effect/, /cosmetic|skin/];
@@ -154,7 +154,9 @@ function start(prisma = getPrisma()) {
   importing = ensureSchema(prisma)
     .then(() => require('./import-linear').importOnce(prisma))
     .then(r => { if (r) console.log(`[Board] Copied from Linear: ${r.cards} cards, ${r.tasks} tasks, ${r.updates} updates`); })
-    .catch(err => console.error('[Board] Copying from Linear failed:', err.message));
+    .then(() => require('./shiny-layout').convertOnce(prisma))
+    .then(r => { if (r) console.log(`[Board] Shinies moved to Shiny Mesh › Shiny Texture on ${r.cards} cards (${r.moved} moved, ${r.added} added)`); })
+    .catch(err => console.error('[Board] Starting up failed:', err.message));
   return importing;
 }
 
