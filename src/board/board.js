@@ -514,6 +514,24 @@ async function renameTask(ref, name, by, prisma = getPrisma()) {
   return findTask(t.id, prisma);
 }
 
+// Moves a task under another task on the same card (a subtask), or with no parent back to the card (a task).
+// A task with subtasks of its own can't become a subtask: move those first.
+async function moveTask(ref, parentRef, by, prisma = getPrisma()) {
+  const t = await findTask(ref, prisma);
+  let parentId = null;
+  if (parentRef) {
+    const p = await findTask(parentRef, prisma);
+    if (p.id === t.id) throw new BoardError(400, 'A task can\'t go under itself');
+    if (p.cardId !== t.cardId) throw new BoardError(400, 'That task is on another card');
+    if (p.parentId) throw new BoardError(400, 'A subtask can\'t have subtasks of its own');
+    const [{ n }] = await prisma.$queryRawUnsafe(`SELECT count(*)::int AS n FROM "BoardCardTask" WHERE "parentId" = $1`, t.id);
+    if (n) throw new BoardError(400, `${t.name} has subtasks of its own: move them first`);
+    parentId = p.id;
+  }
+  await prisma.$executeRawUnsafe(`UPDATE "BoardCardTask" SET "parentId" = $2, "updatedAt" = now() WHERE id = $1`, t.id, parentId);
+  return findTask(t.id, prisma);
+}
+
 // A task (on a card), or a subtask (under a task).
 async function addTask(cardRef, { name, parentId } = {}, by, prisma = getPrisma()) {
   const c = await findCard(cardRef, prisma);
@@ -683,6 +701,6 @@ module.exports = {
   ensureSchema, settings, setSettings, getMeta, setMeta, start, board, roster, findTask, findCard, idOf,
   setStatus, renameTask, addTask, removeTask, createCard, updateCard, archiveCard,
   createUpdate, renameUpdate, removeUpdate, deliver, removeDelivery, deliveriesOf, history, search, tasksOf, working,
-  addImage, useImage, image, removeImage, imageUrl, setNotes, addActivity, nextIdentifier,
+  addImage, useImage, image, removeImage, imageUrl, setNotes, addActivity, nextIdentifier, moveTask,
   BoardError, DEFAULTS, UNIT_TEMPLATE, STATUSES, byBoardOrder, orderOf,
 };

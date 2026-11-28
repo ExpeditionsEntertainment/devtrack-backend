@@ -449,3 +449,24 @@ test('Misc. cards: anything that isn\'t a unit (a mount, a pet), with what it is
   assert.deepEqual([wolf.kind, wolf.category], ['misc', 'Pet']);
   assert.equal(wolf.tasks.length, 2, 'moving keeps its tasks');
 });
+
+test('a task moves under another on its card, and back out', async () => {
+  const { prisma } = await setup();
+  const card = await B.createCard({ name: 'Dio', tasks: [{ name: 'Mesh', subtasks: ['Shiny'] }, { name: 'Texture', subtasks: ['Shiny'] }] }, 'Alex', prisma);
+  const other = await B.createCard({ name: 'Ace' }, 'Alex', prisma);
+  const rows = await prisma.$queryRawUnsafe(`SELECT * FROM "BoardCardTask" WHERE "cardId" = $1`, card.id);
+  const top = n => rows.find(t => !t.parentId && t.name === n);
+  const under = (p, n) => rows.find(t => t.parentId === top(p).id && t.name === n);
+  const otherTask = (await prisma.$queryRawUnsafe(`SELECT identifier FROM "BoardCardTask" WHERE "cardId" = $1 AND "parentId" IS NULL LIMIT 1`, other.id))[0].identifier;
+  await assert.rejects(B.moveTask(top('Texture').identifier, top('Mesh').identifier, 'Alex', prisma), /subtasks of its own: move them first/);
+  await assert.rejects(B.moveTask(top('Texture').identifier, otherTask, 'Alex', prisma), /another card/);
+  await assert.rejects(B.moveTask(top('Texture').identifier, under('Mesh', 'Shiny').identifier, 'Alex', prisma), /subtasks of its own/);
+
+  const shinyMesh = await B.moveTask(under('Mesh', 'Shiny').identifier, null, 'Alex', prisma);
+  await B.renameTask(shinyMesh.identifier, 'Shiny Mesh', 'Alex', prisma);
+  await B.moveTask(under('Texture', 'Shiny').identifier, shinyMesh.identifier, 'Alex', prisma);
+  await B.renameTask(under('Texture', 'Shiny').identifier, 'Shiny Texture', 'Alex', prisma);
+  await B.moveTask(top('Texture').identifier, top('Mesh').identifier, 'Alex', prisma);
+  const dio = (await B.board(prisma, NOW)).cards.find(c => c.id === card.id);
+  assert.deepEqual(dio.tasks.map(t => [t.name, t.subtasks.map(s => s.name)]), [['Mesh', ['Texture']], ['Shiny Mesh', ['Shiny Texture']]]);
+});
