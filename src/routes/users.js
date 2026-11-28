@@ -68,9 +68,9 @@ router.get('/', auth, async (req, res) => {
         u.email,
         u.role,
         CASE
-          WHEN u.role = 'owner' THEN ARRAY['bugs','suggestions','imports','expenses','admin','tasks','reports']::text[]
+          WHEN u.role = 'owner' THEN ARRAY['bugs','suggestions','imports','expenses','admin','tasks','reports','assets']::text[]
           ELSE COALESCE(u."pageAccess", CASE
-          WHEN u.role = 'admin' THEN ARRAY['bugs','suggestions','imports','expenses','admin','tasks','reports']::text[]
+          WHEN u.role = 'admin' THEN ARRAY['bugs','suggestions','imports','expenses','admin','tasks','reports','assets']::text[]
           WHEN u.role = 'engineer' THEN ARRAY['bugs','suggestions','imports','tasks','reports']::text[]
           WHEN u.role IN ('qa', 'reviewer') THEN ARRAY['bugs']::text[]
           ELSE ARRAY['bugs']::text[]

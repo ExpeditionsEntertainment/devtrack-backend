@@ -5,7 +5,7 @@
 const express = require('express');
 const axios = require('axios');
 const auth = require('../middleware/auth');
-const { requireRole } = require('../middleware/roles');
+const { requirePageAccess } = require('../middleware/page-access');
 const devs = require('../devs');
 
 const wrap = fn => (req, res) => fn(req, res).catch(err => {
@@ -22,7 +22,8 @@ function nudgeBot() {
 
 function pageRouter() {
   const router = express.Router();
-  router.use(auth, requireRole('admin'));
+  // Admins, and anyone with the Assets box ticked on their account (Admin > Page Access).
+  router.use(auth, requirePageAccess('assets'));
   router.get('/', wrap(async (req, res) => res.json(await devs.overview())));
   router.post('/', wrap(async (req, res) => { const d = await devs.create(req.body); nudgeBot(); res.status(201).json(d); }));
   router.patch('/:id', wrap(async (req, res) => { const d = await devs.update(req.params.id, req.body); nudgeBot(); res.json(d); }));
